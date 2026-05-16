@@ -464,6 +464,48 @@ extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_store_raw_kv_batc
     }
 }
 
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_attention_prefill_raw(GM_ADDR heads_gm, GM_ADDR sinks_gm, GM_ADDR q_gm, GM_ADDR raw_kv_gm, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, float scale, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> heads;
+    GlobalTensor<float> sinks;
+    GlobalTensor<float> q;
+    GlobalTensor<float> raw_kv;
+    heads.SetGlobalBuffer((__gm__ float *)heads_gm, n_tokens * n_head * head_dim);
+    sinks.SetGlobalBuffer((__gm__ float *)sinks_gm, n_head);
+    q.SetGlobalBuffer((__gm__ float *)q_gm, n_tokens * n_head * head_dim);
+    raw_kv.SetGlobalBuffer((__gm__ float *)raw_kv_gm, n_tokens * head_dim);
+
+    float scores[512];
+    const uint32_t total = n_tokens * n_head;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t h = gid % n_head;
+        const uint32_t t = gid / n_head;
+        const uint32_t raw_start = (window != 0 && t + 1u > window) ? t + 1u - window : 0u;
+        const uint32_t raw_count = t + 1u - raw_start;
+        const uint32_t q_base = (t * n_head + h) * head_dim;
+        float max_s = sinks.GetValue(h);
+        for (uint32_t r = 0; r < raw_count; r++) {
+            const uint32_t kv_base = (raw_start + r) * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += q.GetValue(q_base + d) * raw_kv.GetValue(kv_base + d);
+            const float s = dot * scale;
+            scores[r] = s;
+            if (s > max_s) max_s = s;
+        }
+        float denom = ds4_exp_f32(sinks.GetValue(h) - max_s);
+        for (uint32_t r = 0; r < raw_count; r++) {
+            scores[r] = ds4_exp_f32(scores[r] - max_s);
+            denom += scores[r];
+        }
+        const float inv_denom = 1.0f / denom;
+        for (uint32_t d = 0; d < head_dim; d++) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv.GetValue((raw_start + r) * head_dim + d) * scores[r];
+            heads.SetValue(q_base + d, acc * inv_denom);
+        }
+    }
+}
+
 extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_quantize_q8_k(GM_ADDR out_gm, GM_ADDR x_gm, uint32_t rows, uint32_t cols) {
     GlobalTensor<float> x;
     x.SetGlobalBuffer((__gm__ float *)x_gm, rows * cols);
@@ -584,5 +626,12 @@ extern "C" void ds4_ascend_launch_store_raw_kv_batch(void *stream, void *raw, co
     const uint32_t parts = 8u;
     for (uint32_t p = 0; p < parts; p++) {
         ds4_store_raw_kv_batch<<<1, nullptr, stream>>>((GM_ADDR)raw, (GM_ADDR)kv, raw_cap, pos0, n_tokens, head_dim, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_attention_prefill_raw(void *stream, void *heads, const void *sinks, const void *q, const void *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, float scale) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_attention_prefill_raw<<<1, nullptr, stream>>>((GM_ADDR)heads, (GM_ADDR)sinks, (GM_ADDR)q, (GM_ADDR)raw_kv, n_tokens, window, n_head, head_dim, scale, p, parts);
     }
 }

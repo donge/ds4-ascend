@@ -132,6 +132,7 @@ extern void ds4_ascend_launch_hc_weighted_sum4(void *stream, void *out, const vo
 extern void ds4_ascend_launch_rope_tail_table(void *stream, void *x, const void *table, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot);
 extern void ds4_ascend_launch_fp8_kv_quantize(void *stream, void *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot);
 extern void ds4_ascend_launch_store_raw_kv_batch(void *stream, void *raw, const void *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim);
+extern void ds4_ascend_launch_attention_prefill_raw(void *stream, void *heads, const void *sinks, const void *q, const void *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, float scale);
 
 static int ascend_ok(aclError err, const char *what) {
     if (err == ACL_ERROR_NONE) return 1;
@@ -1314,56 +1315,18 @@ int ds4_gpu_compressor_prefill_state_ratio4_tensor(ds4_gpu_tensor *state_kv, ds4
 }
 int ds4_gpu_attention_decode_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start, const ds4_gpu_tensor *comp_kv, uint32_t n_comp, const ds4_gpu_tensor *comp_mask, uint32_t use_mask, uint32_t n_head, uint32_t head_dim) { return ascend_unimplemented(__func__); }
 int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
-    if (!heads || !model_map || !q || !raw_kv || n_tokens == 0 || n_head == 0 || head_dim == 0) return 0;
+    if (!heads || !model_map || !q || !raw_kv || n_tokens == 0 || n_head == 0 || head_dim == 0 || window > 512u || (window == 0 && n_tokens > 512u)) return 0;
     const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
     const uint64_t kv_count = (uint64_t)n_tokens * head_dim;
-    if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
-        q->bytes < q_count * sizeof(float) || heads->bytes < q_count * sizeof(float) || raw_kv->bytes < kv_count * sizeof(float)) return 0;
-    if (!ascend_host_fallback_begin("attention_prefill_raw", (q_count + kv_count) * sizeof(float), q_count * sizeof(float))) return 0;
-    float *q_host = malloc((size_t)(q_count * sizeof(float)));
-    float *kv_host = malloc((size_t)(kv_count * sizeof(float)));
-    float *out_host = malloc((size_t)(q_count * sizeof(float)));
-    float *scores = malloc((size_t)n_tokens * sizeof(float));
-    if (!q_host || !kv_host || !out_host || !scores) {
-        free(q_host); free(kv_host); free(out_host); free(scores);
-        return 0;
-    }
-    int ok = ds4_gpu_tensor_read(q, 0, q_host, q_count * sizeof(float)) &&
-             ds4_gpu_tensor_read(raw_kv, 0, kv_host, kv_count * sizeof(float));
-    const float *sinks = (const float *)((const uint8_t *)model_map + sinks_offset);
-    if (ok) {
-        const float scale = 1.0f / sqrtf((float)head_dim);
-        for (uint32_t t = 0; t < n_tokens; t++) {
-            const uint32_t raw_start = (window != 0 && t + 1u > window) ? t + 1u - window : 0;
-            const uint32_t raw_count = t + 1u - raw_start;
-            for (uint32_t h = 0; h < n_head; h++) {
-                const float *qh = q_host + ((uint64_t)t * n_head + h) * head_dim;
-                float *oh = out_host + ((uint64_t)t * n_head + h) * head_dim;
-                float max_s = sinks[h];
-                for (uint32_t r = 0; r < raw_count; r++) {
-                    const float *kv = kv_host + (uint64_t)(raw_start + r) * head_dim;
-                    float dot = 0.0f;
-                    for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
-                    const float s = dot * scale;
-                    scores[r] = s;
-                    if (s > max_s) max_s = s;
-                }
-                for (uint32_t d = 0; d < head_dim; d++) oh[d] = 0.0f;
-                float denom = expf(sinks[h] - max_s);
-                for (uint32_t r = 0; r < raw_count; r++) {
-                    const float w = expf(scores[r] - max_s);
-                    const float *kv = kv_host + (uint64_t)(raw_start + r) * head_dim;
-                    denom += w;
-                    for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
-                }
-                const float inv = 1.0f / denom;
-                for (uint32_t d = 0; d < head_dim; d++) oh[d] *= inv;
-            }
-        }
-        ok = ds4_gpu_tensor_write(heads, 0, out_host, q_count * sizeof(float));
-    }
-    free(q_host); free(kv_host); free(out_host); free(scores);
-    return ok;
+    const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
+    if (q_count > UINT32_MAX || kv_count > UINT32_MAX || sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
+        q->bytes < q_count * sizeof(float) || heads->bytes < q_count * sizeof(float) || raw_kv->bytes < kv_count * sizeof(float) ||
+        heads->device != q->device || heads->device != raw_kv->device) return 0;
+    void *sinks_dev = ascend_model_range_device_ptr(model_map, model_size, sinks_offset, sink_bytes, heads->device, "attn_sinks");
+    if (!sinks_dev) return 0;
+    if (!ascend_set_context(heads->device) || !g_streams[heads->device]) return 0;
+    ds4_ascend_launch_attention_prefill_raw(g_streams[heads->device], heads->ptr, sinks_dev, q->ptr, raw_kv->ptr, n_tokens, window, n_head, head_dim, 1.0f / sqrtf((float)head_dim));
+    return 1;
 }
 int ds4_gpu_attention_decode_raw_batch_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start, uint32_t window, uint32_t n_head, uint32_t head_dim) { return ascend_unimplemented(__func__); }
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, const ds4_gpu_tensor *comp_kv, const ds4_gpu_tensor *comp_mask, uint32_t use_comp_mask, uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim) { return ascend_unimplemented(__func__); }

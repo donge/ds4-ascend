@@ -363,6 +363,38 @@ static void store_raw_kv_batch_ref(float *raw, const float *kv, uint32_t raw_cap
     }
 }
 
+static void attention_prefill_raw_ref(float *heads, const float *sinks, const float *q, const float *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    float scores[32];
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t raw_start = (window != 0 && t + 1u > window) ? t + 1u - window : 0u;
+        const uint32_t raw_count = t + 1u - raw_start;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+            float max_s = sinks[h];
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const float *kv = raw_kv + (uint64_t)(raw_start + r) * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                const float s = dot * scale;
+                scores[r] = s;
+                if (s > max_s) max_s = s;
+            }
+            float denom = expf(sinks[h] - max_s);
+            for (uint32_t r = 0; r < raw_count; r++) {
+                scores[r] = expf(scores[r] - max_s);
+                denom += scores[r];
+            }
+            float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+            for (uint32_t d = 0; d < head_dim; d++) {
+                float acc = 0.0f;
+                for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)(raw_start + r) * head_dim + d] * scores[r];
+                oh[d] = acc / denom;
+            }
+        }
+    }
+}
+
 static int check_close(const char *name, const float *want, const float *got, uint32_t count, float tol) {
     for (uint32_t i = 0; i < count; i++) {
         if (fabsf(want[i] - got[i]) > tol) {
@@ -753,6 +785,46 @@ static int check_store_raw_kv(void) {
     return ok;
 }
 
+static int check_attention_prefill_raw(void) {
+    const uint32_t n_tokens = 5;
+    const uint32_t n_head = 3;
+    const uint32_t head_dim = 13;
+    const uint32_t q_count = n_tokens * n_head * head_dim;
+    const uint32_t kv_count = n_tokens * head_dim;
+    float sinks[3] = {-0.375f, 0.125f, 0.5f};
+    uint8_t model[64];
+    memset(model, 0, sizeof(model));
+    memcpy(model + 32, sinks, sizeof(sinks));
+    float *q = malloc((size_t)q_count * sizeof(float));
+    float *kv = malloc((size_t)kv_count * sizeof(float));
+    float *want = malloc((size_t)q_count * sizeof(float));
+    float *got = malloc((size_t)q_count * sizeof(float));
+    if (!q || !kv || !want || !got) {
+        free(q); free(kv); free(want); free(got);
+        return 0;
+    }
+    for (uint32_t i = 0; i < q_count; i++) q[i] = ((int32_t)(i % 37) - 18) * 0.017578125f;
+    for (uint32_t i = 0; i < kv_count; i++) kv[i] = ((int32_t)(i % 29) - 14) * 0.0234375f;
+    attention_prefill_raw_ref(want, sinks, q, kv, n_tokens, 3, n_head, head_dim);
+
+    ds4_gpu_tensor *qt = ds4_gpu_tensor_alloc((uint64_t)q_count * sizeof(float));
+    ds4_gpu_tensor *kvt = ds4_gpu_tensor_alloc((uint64_t)kv_count * sizeof(float));
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc((uint64_t)q_count * sizeof(float));
+    int ok = qt && kvt && heads &&
+             ds4_gpu_tensor_write(qt, 0, q, (uint64_t)q_count * sizeof(float)) &&
+             ds4_gpu_tensor_write(kvt, 0, kv, (uint64_t)kv_count * sizeof(float)) &&
+             ds4_gpu_attention_prefill_raw_heads_tensor(heads, model, sizeof(model), 32, qt, kvt, n_tokens, 3, n_head, head_dim) &&
+             ds4_gpu_synchronize() &&
+             ds4_gpu_tensor_read(heads, 0, got, (uint64_t)q_count * sizeof(float));
+    if (ok) ok = check_close("attention prefill raw", want, got, q_count, 2e-3f);
+
+    ds4_gpu_tensor_free(heads);
+    ds4_gpu_tensor_free(kvt);
+    ds4_gpu_tensor_free(qt);
+    free(q); free(kv); free(want); free(got);
+    return ok;
+}
+
 static int check_quantize(void) {
     const uint32_t rows = 2;
     const uint32_t cols = 512;
@@ -823,7 +895,8 @@ int main(void) {
     int ok = check_fill() && check_matmul_f16() && check_matmul_q8_0() &&
              check_rms_norm_plain() && check_rms_norm_weight() && check_head_rms_norm() &&
              check_hc_split_sinkhorn() && check_hc_weighted_sum() && check_fp8_kv_quantize() &&
-             check_rope_tail() && check_store_raw_kv() && check_quantize();
+             check_rope_tail() && check_store_raw_kv() && check_attention_prefill_raw() &&
+             check_quantize();
     if (ok) printf("ascend_fill_smoke: ok\n");
 
     ds4_gpu_cleanup();
