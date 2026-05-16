@@ -11398,8 +11398,8 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
+        "  --metal | --cuda | --ascend | --cpu | --backend NAME\n"
+        "      Select backend explicitly. Defaults to Metal on macOS, Ascend on Ascend builds, and CUDA on CUDA builds.\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"
@@ -11460,9 +11460,10 @@ static void usage(FILE *fp) {
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+    if (!strcmp(s, "ascend")) return DS4_BACKEND_ASCEND;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, cpu");
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, ascend, cpu");
     exit(2);
 }
 
@@ -11471,6 +11472,8 @@ static ds4_backend default_server_backend(void) {
     return DS4_BACKEND_CPU;
 #elif defined(__APPLE__)
     return DS4_BACKEND_METAL;
+#elif defined(DS4_ASCEND_BACKEND)
+    return DS4_BACKEND_ASCEND;
 #else
     return DS4_BACKEND_CUDA;
 #endif
@@ -11554,6 +11557,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--ascend")) {
+            c.engine.backend = DS4_BACKEND_ASCEND;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {

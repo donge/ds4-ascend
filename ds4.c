@@ -71,7 +71,9 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
 static bool ds4_backend_uses_graph(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
+    return backend == DS4_BACKEND_METAL ||
+           backend == DS4_BACKEND_CUDA ||
+           backend == DS4_BACKEND_ASCEND;
 }
 
 /* =========================================================================
@@ -1372,6 +1374,8 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
     return mb * 1048576ull;
 }
 
+static bool tensor_is_routed_expert_type(uint32_t type);
+
 static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
     accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
     uint64_t nspan = 0;
@@ -1424,8 +1428,39 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
 }
 
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
-    if (backend != DS4_BACKEND_CUDA) return true;
+    if (backend != DS4_BACKEND_CUDA && backend != DS4_BACKEND_ASCEND) return true;
     if (!m || !m->map || m->size == 0) return false;
+
+    if (backend == DS4_BACKEND_ASCEND) {
+        const double t0 = now_sec();
+        uint64_t routed = 0;
+        for (uint64_t i = 0; i < m->n_tensors; i++) {
+            const ds4_tensor *t = &m->tensors[i];
+            if (t->bytes == 0) continue;
+            if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
+            char label[128];
+            snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
+            if (ds4_gpu_cache_model_range(m->map, m->size, t->abs_offset, t->bytes, label) == 0) {
+                fprintf(stderr, "ds4: accelerator failed to register tensor %.*s\n",
+                        (int)t->name.len, t->name.ptr);
+                return false;
+            }
+            if (t->ndim == 3 && tensor_is_routed_expert_type(t->type) &&
+                ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
+                fprintf(stderr, "ds4: accelerator failed to cache routed expert tensor %.*s\n",
+                        (int)t->name.len, t->name.ptr);
+                return false;
+            }
+            if (t->ndim == 3 && tensor_is_routed_expert_type(t->type)) routed += t->bytes;
+        }
+        const double t1 = now_sec();
+        fprintf(stderr,
+                "ds4: Ascend startup routed expert sharding prepared %.2f GiB of q2 tensors in %.3fs\n",
+                (double)routed / 1073741824.0,
+                t1 - t0);
+        return true;
+    }
+
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
         return true;
     }
@@ -15481,9 +15516,10 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
 
 const char *ds4_backend_name(ds4_backend backend) {
     switch (backend) {
-    case DS4_BACKEND_METAL: return "metal";
-    case DS4_BACKEND_CUDA:  return "cuda";
-    case DS4_BACKEND_CPU:   return "cpu";
+    case DS4_BACKEND_METAL:  return "metal";
+    case DS4_BACKEND_CUDA:   return "cuda";
+    case DS4_BACKEND_ASCEND: return "ascend";
+    case DS4_BACKEND_CPU:    return "cpu";
     }
     return "unknown";
 }
@@ -17065,8 +17101,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {
-#ifdef __APPLE__
-        fprintf(stderr, "ds4: CUDA backend requested but this build is linked with Metal, not CUDA\n");
+#if defined(__APPLE__) || defined(DS4_ASCEND_BACKEND)
+        fprintf(stderr, "ds4: CUDA backend requested but this build is not linked with CUDA\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -17074,7 +17110,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
     if (e->backend == DS4_BACKEND_METAL) {
 #ifndef __APPLE__
-        fprintf(stderr, "ds4: Metal backend requested but this build is linked with CUDA, not Metal\n");
+        fprintf(stderr, "ds4: Metal backend requested but this build is not linked with Metal\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+#endif
+    }
+    if (e->backend == DS4_BACKEND_ASCEND) {
+#ifndef DS4_ASCEND_BACKEND
+        fprintf(stderr, "ds4: Ascend backend requested but this build is not linked with AscendCL\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;

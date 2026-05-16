@@ -95,10 +95,12 @@ static void usage(FILE *fp) {
         "      Use the Metal graph backend. This is the normal fast path on macOS.\n"
         "  --cuda\n"
         "      Use the CUDA graph backend. This is the normal fast path on CUDA builds.\n"
+        "  --ascend\n"
+        "      Use the AscendCL graph backend. This is the native path for Atlas / Ascend NPU builds.\n"
         "  --cpu\n"
         "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
         "  --backend NAME\n"
-        "      Select backend explicitly: metal, cuda, or cpu.\n"
+        "      Select backend explicitly: metal, cuda, ascend, or cpu.\n"
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
@@ -224,9 +226,10 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+    if (!strcmp(s, "ascend")) return DS4_BACKEND_ASCEND;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
-    fprintf(stderr, "ds4: valid backends are: metal, cuda, cpu\n");
+    fprintf(stderr, "ds4: valid backends are: metal, cuda, ascend, cpu\n");
     exit(2);
 }
 
@@ -235,6 +238,8 @@ static ds4_backend default_backend(void) {
     return DS4_BACKEND_CPU;
 #elif defined(__APPLE__)
     return DS4_BACKEND_METAL;
+#elif defined(DS4_ASCEND_BACKEND)
+    return DS4_BACKEND_ASCEND;
 #else
     return DS4_BACKEND_CUDA;
 #endif
@@ -1262,6 +1267,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--ascend")) {
+            c.engine.backend = DS4_BACKEND_ASCEND;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {
