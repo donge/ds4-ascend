@@ -135,6 +135,7 @@ extern void ds4_ascend_launch_fp8_kv_quantize(void *stream, void *x, uint32_t n_
 extern void ds4_ascend_launch_store_raw_kv_batch(void *stream, void *raw, const void *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim);
 extern void ds4_ascend_launch_attention_prefill_raw(void *stream, void *heads, const void *sinks, const void *q, const void *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, float scale);
 extern void ds4_ascend_launch_attention_output_low_q8(void *stream, void *low, const void *w, const void *heads, uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens);
+extern void ds4_ascend_launch_router_select(void *stream, void *selected, void *weights, void *probs, const void *bias, const void *hash, const void *logits, const void *tokens, int32_t token_scalar, uint32_t hash_rows, uint32_t n_tokens, uint32_t has_bias, uint32_t hash_mode);
 
 static int ascend_ok(aclError err, const char *what) {
     if (err == ACL_ERROR_NONE) return 1;
@@ -1476,100 +1477,39 @@ int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_g
 }
 int ds4_gpu_directional_steering_project_tensor(ds4_gpu_tensor *x, const ds4_gpu_tensor *directions, uint32_t layer, uint32_t width, uint32_t rows, float scale) { return ascend_unimplemented(__func__); }
 
-static float ascend_softplus(float x) {
-    if (x > 20.0f) return x;
-    if (x < -20.0f) return expf(x);
-    return log1pf(expf(x));
-}
-
-static int ascend_router_select_host(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, int32_t token_scalar, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_tokens) {
+static int ascend_router_select(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, int32_t token_scalar, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_tokens) {
     if (!selected || !weights || !probs || !logits || !model_map || n_tokens == 0 ||
-        n_expert_groups > 1u || n_group_used > 0u ||
+        n_expert_groups > 1u || n_group_used > 0u || n_tokens > UINT32_MAX ||
         logits->bytes < (uint64_t)n_tokens * DS4_ASCEND_N_EXPERT * sizeof(float) ||
         probs->bytes < (uint64_t)n_tokens * DS4_ASCEND_N_EXPERT * sizeof(float) ||
         selected->bytes < (uint64_t)n_tokens * DS4_ASCEND_N_EXPERT_USED * sizeof(int32_t) ||
-        weights->bytes < (uint64_t)n_tokens * DS4_ASCEND_N_EXPERT_USED * sizeof(float)) return 0;
+        weights->bytes < (uint64_t)n_tokens * DS4_ASCEND_N_EXPERT_USED * sizeof(float) ||
+        selected->device != logits->device || selected->device != weights->device || selected->device != probs->device ||
+        (tokens && (tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t) || tokens->device != selected->device))) return 0;
 
-    const float *bias = NULL;
-    const int32_t *hash = NULL;
+    void *bias = NULL;
+    void *hash = NULL;
     if (has_bias && !hash_mode) {
-        bias = (const float *)ascend_model_range_ptr(model_map, model_size, bias_offset, DS4_ASCEND_N_EXPERT * sizeof(float), "router_bias");
+        bias = ascend_model_range_device_ptr(model_map, model_size, bias_offset, DS4_ASCEND_N_EXPERT * sizeof(float), logits->device, "router_bias");
         if (!bias) return 0;
     }
     if (hash_mode) {
-        hash = (const int32_t *)ascend_model_range_ptr(model_map, model_size, hash_offset, (uint64_t)hash_rows * DS4_ASCEND_N_EXPERT_USED * sizeof(int32_t), "router_hash");
+        if (hash_rows == 0) return 0;
+        hash = ascend_model_range_device_ptr(model_map, model_size, hash_offset, (uint64_t)hash_rows * DS4_ASCEND_N_EXPERT_USED * sizeof(int32_t), logits->device, "router_hash");
         if (!hash) return 0;
     }
 
-    const uint64_t logits_count = (uint64_t)n_tokens * DS4_ASCEND_N_EXPERT;
-    const uint64_t selected_count = (uint64_t)n_tokens * DS4_ASCEND_N_EXPERT_USED;
-    const uint64_t tokens_bytes = tokens ? (uint64_t)n_tokens * sizeof(int32_t) : 0u;
-    const uint64_t router_out_bytes = logits_count * sizeof(float) + selected_count * (sizeof(int32_t) + sizeof(float));
-    if (!ascend_host_fallback_begin("router_select", logits_count * sizeof(float) + tokens_bytes, router_out_bytes)) return 0;
-    float *logits_host = malloc((size_t)(logits_count * sizeof(float)));
-    float *probs_host = malloc((size_t)(logits_count * sizeof(float)));
-    int32_t *selected_host = malloc((size_t)(selected_count * sizeof(int32_t)));
-    float *weights_host = malloc((size_t)(selected_count * sizeof(float)));
-    int32_t *tokens_host = tokens ? malloc((size_t)n_tokens * sizeof(int32_t)) : NULL;
-    if (!logits_host || !probs_host || !selected_host || !weights_host || (tokens && !tokens_host)) {
-        free(logits_host); free(probs_host); free(selected_host); free(weights_host); free(tokens_host);
-        return 0;
-    }
-
-    int ok = ds4_gpu_tensor_read(logits, 0, logits_host, logits_count * sizeof(float));
-    if (ok && tokens) ok = ds4_gpu_tensor_read(tokens, 0, tokens_host, (uint64_t)n_tokens * sizeof(int32_t));
-    if (ok) {
-        for (uint32_t t = 0; t < n_tokens; t++) {
-            const float *log = logits_host + (uint64_t)t * DS4_ASCEND_N_EXPERT;
-            float *prob = probs_host + (uint64_t)t * DS4_ASCEND_N_EXPERT;
-            int32_t *sel = selected_host + (uint64_t)t * DS4_ASCEND_N_EXPERT_USED;
-            float *w = weights_host + (uint64_t)t * DS4_ASCEND_N_EXPERT_USED;
-            for (uint32_t i = 0; i < DS4_ASCEND_N_EXPERT; i++) prob[i] = sqrtf(ascend_softplus(log[i]));
-            if (hash_mode) {
-                int32_t tok = tokens_host ? tokens_host[t] : token_scalar;
-                if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
-                const int32_t *row = hash + (uint64_t)(uint32_t)tok * DS4_ASCEND_N_EXPERT_USED;
-                for (uint32_t i = 0; i < DS4_ASCEND_N_EXPERT_USED; i++) sel[i] = row[i];
-            } else {
-                for (uint32_t i = 0; i < DS4_ASCEND_N_EXPERT_USED; i++) sel[i] = -1;
-                for (uint32_t e = 0; e < DS4_ASCEND_N_EXPERT; e++) {
-                    const float score = prob[e] + (has_bias ? bias[e] : 0.0f);
-                    for (uint32_t j = 0; j < DS4_ASCEND_N_EXPERT_USED; j++) {
-                        const int32_t cur = sel[j];
-                        const float cur_score = cur >= 0 ? prob[(uint32_t)cur] + (has_bias ? bias[(uint32_t)cur] : 0.0f) : 0.0f;
-                        if (cur < 0 || score > cur_score) {
-                            for (uint32_t k = DS4_ASCEND_N_EXPERT_USED - 1u; k > j; k--) sel[k] = sel[k - 1u];
-                            sel[j] = (int32_t)e;
-                            break;
-                        }
-                    }
-                }
-            }
-            float sum = 0.0f;
-            for (uint32_t i = 0; i < DS4_ASCEND_N_EXPERT_USED; i++) {
-                const int32_t e = sel[i];
-                const float v = (e >= 0 && (uint32_t)e < DS4_ASCEND_N_EXPERT) ? prob[(uint32_t)e] : 0.0f;
-                w[i] = v;
-                sum += v;
-            }
-            if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
-            for (uint32_t i = 0; i < DS4_ASCEND_N_EXPERT_USED; i++) w[i] = w[i] / sum * 1.5f;
-        }
-        ok = ds4_gpu_tensor_write(probs, 0, probs_host, logits_count * sizeof(float)) &&
-             ds4_gpu_tensor_write(selected, 0, selected_host, selected_count * sizeof(int32_t)) &&
-             ds4_gpu_tensor_write(weights, 0, weights_host, selected_count * sizeof(float));
-    }
-
-    free(logits_host); free(probs_host); free(selected_host); free(weights_host); free(tokens_host);
-    return ok;
+    if (!ascend_set_context(selected->device) || !g_streams[selected->device]) return 0;
+    ds4_ascend_launch_router_select(g_streams[selected->device], selected->ptr, weights->ptr, probs->ptr, bias, hash, logits->ptr, tokens ? tokens->ptr : NULL, token_scalar, hash_rows, n_tokens, has_bias && !hash_mode ? 1u : 0u, hash_mode ? 1u : 0u);
+    return 1;
 }
 
 int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
-    return ascend_router_select_host(selected, weights, probs, model_map, model_size, bias_offset, hash_offset, hash_rows, (int32_t)token, n_expert_groups, n_group_used, has_bias, hash_mode, logits, NULL, 1);
+    return ascend_router_select(selected, weights, probs, model_map, model_size, bias_offset, hash_offset, hash_rows, (int32_t)token, n_expert_groups, n_group_used, has_bias, hash_mode, logits, NULL, 1);
 }
 
 int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_tokens) {
-    return ascend_router_select_host(selected, weights, probs, model_map, model_size, bias_offset, hash_offset, hash_rows, 0, n_expert_groups, n_group_used, has_bias, hash_mode, logits, tokens, n_tokens);
+    return ascend_router_select(selected, weights, probs, model_map, model_size, bias_offset, hash_offset, hash_rows, 0, n_expert_groups, n_group_used, has_bias, hash_mode, logits, tokens, n_tokens);
 }
 
 int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *experts, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x) {

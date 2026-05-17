@@ -8,6 +8,8 @@ using namespace AscendC;
 #define DS4_QK_K 256u
 #define DS4_QK8_0 32u
 #define DS4_BLOCK_Q8_0_BYTES 34u
+#define DS4_N_EXPERT 256u
+#define DS4_N_EXPERT_USED 6u
 
 typedef struct {
     float d;
@@ -52,6 +54,40 @@ static __aicore__ inline float ds4_sigmoid_f32(float x) {
     }
     const float e = ds4_exp_f32(x);
     return e / (1.0f + e);
+}
+
+static __aicore__ inline float ds4_sqrt_f32(float x) {
+    if (x <= 0.0f) return 0.0f;
+    return x * ds4_rsqrt_f32(x);
+}
+
+static __aicore__ inline float ds4_log_f32(float x) {
+    if (x <= 0.0f) return -3.402823466e+38f;
+    union { float f; uint32_t u; } v;
+    v.f = x;
+    const int32_t exp = (int32_t)((v.u >> 23) & 0xffu) - 127;
+    v.u = (v.u & 0x007fffffu) | 0x3f800000u;
+    const float m = v.f;
+    const float z = (m - 1.0f) / (m + 1.0f);
+    const float z2 = z * z;
+    float term = z;
+    float sum = term;
+    term *= z2; sum += term * 0.3333333333333333f;
+    term *= z2; sum += term * 0.2f;
+    term *= z2; sum += term * 0.14285714285714285f;
+    term *= z2; sum += term * 0.1111111111111111f;
+    term *= z2; sum += term * 0.09090909090909091f;
+    return 0.6931471805599453f * (float)exp + 2.0f * sum;
+}
+
+static __aicore__ inline float ds4_softplus_f32(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return ds4_exp_f32(x);
+    return ds4_log_f32(1.0f + ds4_exp_f32(x));
+}
+
+static __aicore__ inline bool ds4_router_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
+    return av > bv || (av == bv && ai < bi);
 }
 
 static __aicore__ inline float ds4_pow2_ceil_scale_for_fp8(float amax) {
@@ -314,6 +350,78 @@ extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_hc_weighted_sum4(
                           residual.GetValue(res_base + 2u * n_embd) * weights.GetValue(w_base + 2u) +
                           residual.GetValue(res_base + 3u * n_embd) * weights.GetValue(w_base + 3u);
         out.SetValue(gid, acc);
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_router_select(GM_ADDR selected_gm, GM_ADDR weights_gm, GM_ADDR probs_gm, GM_ADDR bias_gm, GM_ADDR hash_gm, GM_ADDR logits_gm, GM_ADDR tokens_gm, int32_t token_scalar, uint32_t hash_rows, uint32_t n_tokens, uint32_t has_bias, uint32_t hash_mode, uint32_t start_row, uint32_t stride) {
+    GlobalTensor<int32_t> selected;
+    GlobalTensor<float> weights;
+    GlobalTensor<float> probs;
+    GlobalTensor<float> bias;
+    GlobalTensor<int32_t> hash;
+    GlobalTensor<float> logits;
+    GlobalTensor<int32_t> tokens;
+    selected.SetGlobalBuffer((__gm__ int32_t *)selected_gm, n_tokens * DS4_N_EXPERT_USED);
+    weights.SetGlobalBuffer((__gm__ float *)weights_gm, n_tokens * DS4_N_EXPERT_USED);
+    probs.SetGlobalBuffer((__gm__ float *)probs_gm, n_tokens * DS4_N_EXPERT);
+    if (has_bias) bias.SetGlobalBuffer((__gm__ float *)bias_gm, DS4_N_EXPERT);
+    if (hash_mode) hash.SetGlobalBuffer((__gm__ int32_t *)hash_gm, hash_rows * DS4_N_EXPERT_USED);
+    logits.SetGlobalBuffer((__gm__ float *)logits_gm, n_tokens * DS4_N_EXPERT);
+    if (tokens_gm) tokens.SetGlobalBuffer((__gm__ int32_t *)tokens_gm, n_tokens);
+
+    if (stride == 0) stride = 1;
+    for (uint32_t t = start_row; t < n_tokens; t += stride) {
+        float prob_local[DS4_N_EXPERT];
+        const uint32_t prob_base = t * DS4_N_EXPERT;
+        for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+            const float p = ds4_sqrt_f32(ds4_softplus_f32(logits.GetValue(prob_base + e)));
+            prob_local[e] = p;
+            probs.SetValue(prob_base + e, p);
+        }
+
+        int32_t sel[DS4_N_EXPERT_USED];
+        if (hash_mode) {
+            int32_t tok = tokens_gm ? tokens.GetValue(t) : token_scalar;
+            if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
+            const uint32_t hash_base = (uint32_t)tok * DS4_N_EXPERT_USED;
+            for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) sel[i] = hash.GetValue(hash_base + i);
+        } else {
+            float scores[DS4_N_EXPERT_USED];
+            for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+                sel[i] = -1;
+                scores[i] = -3.402823466e+38f;
+            }
+            for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+                const float score = prob_local[e] + (has_bias ? bias.GetValue(e) : 0.0f);
+                for (uint32_t j = 0; j < DS4_N_EXPERT_USED; j++) {
+                    const uint32_t cur = sel[j] >= 0 ? (uint32_t)sel[j] : UINT32_MAX;
+                    if (sel[j] < 0 || ds4_router_score_better(score, e, scores[j], cur)) {
+                        for (uint32_t k = DS4_N_EXPERT_USED - 1u; k > j; k--) {
+                            sel[k] = sel[k - 1u];
+                            scores[k] = scores[k - 1u];
+                        }
+                        sel[j] = (int32_t)e;
+                        scores[j] = score;
+                        break;
+                    }
+                }
+            }
+        }
+
+        float sum = 0.0f;
+        float w[DS4_N_EXPERT_USED];
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            const int32_t e = sel[i];
+            const float v = (e >= 0 && (uint32_t)e < DS4_N_EXPERT) ? prob_local[(uint32_t)e] : 0.0f;
+            w[i] = v;
+            sum += v;
+        }
+        if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+        const uint32_t out_base = t * DS4_N_EXPERT_USED;
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            selected.SetValue(out_base + i, sel[i]);
+            weights.SetValue(out_base + i, w[i] / sum * 1.5f);
+        }
     }
 }
 
@@ -673,6 +781,13 @@ extern "C" void ds4_ascend_launch_rms_norm_inplace(void *stream, void *x, uint32
     const float inv_n = 1.0f / (float)n;
     for (uint32_t p = 0; p < parts; p++) {
         ds4_rms_norm_inplace<<<1, nullptr, stream>>>((GM_ADDR)x, n, rows, inv_n, eps, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_router_select(void *stream, void *selected, void *weights, void *probs, const void *bias, const void *hash, const void *logits, const void *tokens, int32_t token_scalar, uint32_t hash_rows, uint32_t n_tokens, uint32_t has_bias, uint32_t hash_mode) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_router_select<<<1, nullptr, stream>>>((GM_ADDR)selected, (GM_ADDR)weights, (GM_ADDR)probs, (GM_ADDR)bias, (GM_ADDR)hash, (GM_ADDR)logits, (GM_ADDR)tokens, token_scalar, hash_rows, n_tokens, has_bias, hash_mode, p, parts);
     }
 }
 

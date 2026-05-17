@@ -202,6 +202,81 @@ static void hc_weighted_sum_ref(float *out, const float *residual, const float *
     }
 }
 
+static float router_exp_approx_ref(float x) {
+    if (x < -20.0f) return 0.0f;
+    if (x > 20.0f) x = 20.0f;
+    float y = 1.0f + x * 0.00048828125f;
+    y *= y; y *= y; y *= y; y *= y;
+    y *= y; y *= y; y *= y; y *= y;
+    y *= y; y *= y; y *= y;
+    return y;
+}
+
+static float router_log_approx_ref(float x) {
+    if (x <= 0.0f) return -3.402823466e+38f;
+    uint32_t u;
+    memcpy(&u, &x, sizeof(u));
+    const int32_t exp = (int32_t)((u >> 23) & 0xffu) - 127;
+    u = (u & 0x007fffffu) | 0x3f800000u;
+    float m;
+    memcpy(&m, &u, sizeof(m));
+    const float z = (m - 1.0f) / (m + 1.0f);
+    const float z2 = z * z;
+    float term = z;
+    float sum = term;
+    term *= z2; sum += term * 0.3333333333333333f;
+    term *= z2; sum += term * 0.2f;
+    term *= z2; sum += term * 0.14285714285714285f;
+    term *= z2; sum += term * 0.1111111111111111f;
+    term *= z2; sum += term * 0.09090909090909091f;
+    return 0.6931471805599453f * (float)exp + 2.0f * sum;
+}
+
+static float router_softplus_ref(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return router_exp_approx_ref(x);
+    return router_log_approx_ref(1.0f + router_exp_approx_ref(x));
+}
+
+static void router_select_ref(int32_t *selected, float *weights, float *probs, const float *bias, const int32_t *hash, const float *logits, const int32_t *tokens, int32_t token_scalar, uint32_t hash_rows, uint32_t n_tokens, int has_bias, int hash_mode) {
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const float *log = logits + (uint64_t)t * 256u;
+        float *prob = probs + (uint64_t)t * 256u;
+        int32_t *sel = selected + (uint64_t)t * 6u;
+        float *w = weights + (uint64_t)t * 6u;
+        for (uint32_t i = 0; i < 256u; i++) prob[i] = sqrtf(router_softplus_ref(log[i]));
+        if (hash_mode) {
+            int32_t tok = tokens ? tokens[t] : token_scalar;
+            if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
+            const int32_t *row = hash + (uint64_t)(uint32_t)tok * 6u;
+            for (uint32_t i = 0; i < 6u; i++) sel[i] = row[i];
+        } else {
+            for (uint32_t i = 0; i < 6u; i++) sel[i] = -1;
+            for (uint32_t e = 0; e < 256u; e++) {
+                const float score = prob[e] + (has_bias ? bias[e] : 0.0f);
+                for (uint32_t j = 0; j < 6u; j++) {
+                    const int32_t cur = sel[j];
+                    const float cur_score = cur >= 0 ? prob[(uint32_t)cur] + (has_bias ? bias[(uint32_t)cur] : 0.0f) : 0.0f;
+                    if (cur < 0 || score > cur_score) {
+                        for (uint32_t k = 5u; k > j; k--) sel[k] = sel[k - 1u];
+                        sel[j] = (int32_t)e;
+                        break;
+                    }
+                }
+            }
+        }
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < 6u; i++) {
+            const int32_t e = sel[i];
+            const float v = (e >= 0 && (uint32_t)e < 256u) ? prob[(uint32_t)e] : 0.0f;
+            w[i] = v;
+            sum += v;
+        }
+        if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+        for (uint32_t i = 0; i < 6u; i++) w[i] = w[i] / sum * 1.5f;
+    }
+}
+
 static void hc_expand_split_ref(float *out, const float *block_out, const float *block_add, const float *residual, const float *split, uint32_t n_embd, uint32_t n_hc, uint32_t rows) {
     const uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     for (uint32_t r = 0; r < rows; r++) {
@@ -621,6 +696,81 @@ static int check_head_rms_norm(void) {
     return ok;
 }
 
+static int check_router_select(void) {
+    const uint32_t n_tokens = 3;
+    const uint32_t logits_count = n_tokens * 256u;
+    const uint32_t selected_count = n_tokens * 6u;
+    const uint32_t hash_rows = 4;
+    float *logits = malloc((size_t)logits_count * sizeof(float));
+    float *bias = malloc(256u * sizeof(float));
+    float *want_probs = malloc((size_t)logits_count * sizeof(float));
+    float *got_probs = malloc((size_t)logits_count * sizeof(float));
+    float *want_weights = malloc((size_t)selected_count * sizeof(float));
+    float *got_weights = malloc((size_t)selected_count * sizeof(float));
+    int32_t *want_selected = malloc((size_t)selected_count * sizeof(int32_t));
+    int32_t *got_selected = malloc((size_t)selected_count * sizeof(int32_t));
+    int32_t *hash = malloc((size_t)hash_rows * 6u * sizeof(int32_t));
+    int32_t tokens[3] = {2, -1, 9};
+    if (!logits || !bias || !want_probs || !got_probs || !want_weights || !got_weights || !want_selected || !got_selected || !hash) {
+        free(logits); free(bias); free(want_probs); free(got_probs); free(want_weights); free(got_weights); free(want_selected); free(got_selected); free(hash);
+        return 0;
+    }
+    for (uint32_t i = 0; i < logits_count; i++) logits[i] = ((int32_t)(i % 97) - 48) * 0.03125f;
+    logits[17] = 9.0f;
+    logits[113] = 8.5f;
+    logits[255] = 8.5f;
+    for (uint32_t i = 0; i < 256u; i++) bias[i] = ((int32_t)(i % 19) - 9) * 0.0078125f;
+    for (uint32_t r = 0; r < hash_rows; r++) {
+        for (uint32_t i = 0; i < 6u; i++) hash[r * 6u + i] = (int32_t)((r * 37u + i * 11u) % 256u);
+    }
+    uint8_t *model = calloc(1, 1024u + (size_t)hash_rows * 6u * sizeof(int32_t));
+    if (!model) {
+        free(logits); free(bias); free(want_probs); free(got_probs); free(want_weights); free(got_weights); free(want_selected); free(got_selected); free(hash);
+        return 0;
+    }
+    memcpy(model, bias, 256u * sizeof(float));
+    memcpy(model + 1024u, hash, (size_t)hash_rows * 6u * sizeof(int32_t));
+
+    ds4_gpu_tensor *lt = ds4_gpu_tensor_alloc((uint64_t)logits_count * sizeof(float));
+    ds4_gpu_tensor *probs = ds4_gpu_tensor_alloc((uint64_t)logits_count * sizeof(float));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc((uint64_t)selected_count * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc((uint64_t)selected_count * sizeof(int32_t));
+    ds4_gpu_tensor *tokt = ds4_gpu_tensor_alloc(sizeof(tokens));
+    int ok = lt && probs && weights && selected && tokt &&
+             ds4_gpu_tensor_write(lt, 0, logits, (uint64_t)logits_count * sizeof(float)) &&
+             ds4_gpu_router_select_tensor(selected, weights, probs, model, 1024u + (uint64_t)hash_rows * 6u * sizeof(int32_t), 0, 1024, hash_rows, 0, 1, 0, true, false, lt) &&
+             ds4_gpu_synchronize() &&
+             ds4_gpu_tensor_read(probs, 0, got_probs, (uint64_t)logits_count * sizeof(float)) &&
+             ds4_gpu_tensor_read(weights, 0, got_weights, (uint64_t)6u * sizeof(float)) &&
+             ds4_gpu_tensor_read(selected, 0, got_selected, (uint64_t)6u * sizeof(int32_t));
+    if (ok) {
+        router_select_ref(want_selected, want_weights, want_probs, bias, hash, logits, NULL, 0, hash_rows, 1, 1, 0);
+        ok = check_close("router probs", want_probs, got_probs, 256u, 2e-4f) &&
+             check_close("router weights", want_weights, got_weights, 6u, 2e-4f) &&
+             memcmp(want_selected, got_selected, 6u * sizeof(int32_t)) == 0;
+    }
+    if (ok) {
+        router_select_ref(want_selected, want_weights, want_probs, bias, hash, logits, tokens, 0, hash_rows, n_tokens, 0, 1);
+        ok = ds4_gpu_tensor_write(tokt, 0, tokens, sizeof(tokens)) &&
+             ds4_gpu_router_select_batch_tensor(selected, weights, probs, model, 1024u + (uint64_t)hash_rows * 6u * sizeof(int32_t), 0, 1024, hash_rows, 1, 0, false, true, lt, tokt, n_tokens) &&
+             ds4_gpu_synchronize() &&
+             ds4_gpu_tensor_read(probs, 0, got_probs, (uint64_t)logits_count * sizeof(float)) &&
+             ds4_gpu_tensor_read(weights, 0, got_weights, (uint64_t)selected_count * sizeof(float)) &&
+             ds4_gpu_tensor_read(selected, 0, got_selected, (uint64_t)selected_count * sizeof(int32_t));
+        if (ok) ok = check_close("router hash probs", want_probs, got_probs, logits_count, 2e-4f) &&
+                     check_close("router hash weights", want_weights, got_weights, selected_count, 2e-4f) &&
+                     memcmp(want_selected, got_selected, (size_t)selected_count * sizeof(int32_t)) == 0;
+    }
+
+    ds4_gpu_tensor_free(tokt);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(probs);
+    ds4_gpu_tensor_free(lt);
+    free(model); free(logits); free(bias); free(want_probs); free(got_probs); free(want_weights); free(got_weights); free(want_selected); free(got_selected); free(hash);
+    return ok;
+}
+
 static int check_hc_weighted_sum(void) {
     const uint32_t rows = 5;
     const uint32_t n_embd = 37;
@@ -1024,7 +1174,7 @@ int main(void) {
 
     int ok = check_fill() && check_matmul_f16() && check_matmul_q8_0() &&
              check_rms_norm_plain() && check_rms_norm_weight() && check_head_rms_norm() &&
-             check_hc_split_sinkhorn() && check_hc_weighted_sum() && check_hc_expand_split() && check_fp8_kv_quantize() &&
+             check_router_select() && check_hc_split_sinkhorn() && check_hc_weighted_sum() && check_hc_expand_split() && check_fp8_kv_quantize() &&
              check_rope_tail() && check_store_raw_kv() && check_attention_prefill_raw() &&
              check_attention_output_low_q8() && check_quantize();
     if (ok) printf("ascend_fill_smoke: ok\n");
