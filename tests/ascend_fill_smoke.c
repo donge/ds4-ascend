@@ -825,6 +825,64 @@ static int check_attention_prefill_raw(void) {
     return ok;
 }
 
+static int check_attention_output_low_q8(void) {
+    const uint32_t n_tokens = 2;
+    const uint32_t n_groups = 3;
+    const uint32_t group_dim = 45;
+    const uint32_t rank = 5;
+    const uint32_t blocks = (group_dim + 31u) / 32u;
+    const uint32_t heads_count = n_tokens * n_groups * group_dim;
+    const uint32_t low_count = n_tokens * n_groups * rank;
+    const uint32_t out_dim = 4;
+    const uint32_t low_dim = n_groups * rank;
+    const uint32_t blocks_b = (low_dim + 31u) / 32u;
+    const uint64_t weight_bytes = (uint64_t)n_groups * rank * blocks * sizeof(block_q8_0);
+    const uint64_t weight_offset = 128;
+    const uint64_t weight_b_offset = weight_offset + weight_bytes;
+    const uint64_t weight_b_bytes = (uint64_t)out_dim * blocks_b * sizeof(block_q8_0);
+    uint8_t *model = calloc(1, (size_t)(weight_b_offset + weight_b_bytes));
+    float *heads = malloc((size_t)heads_count * sizeof(float));
+    float *w_f32 = malloc((size_t)n_groups * rank * group_dim * sizeof(float));
+    float *w_b_f32 = malloc((size_t)out_dim * low_dim * sizeof(float));
+    float *want = malloc((size_t)low_count * sizeof(float));
+    float *got = malloc((size_t)low_count * sizeof(float));
+    if (!model || !heads || !w_f32 || !w_b_f32 || !want || !got) {
+        free(model); free(heads); free(w_f32); free(w_b_f32); free(want); free(got);
+        return 0;
+    }
+    block_q8_0 *w = (block_q8_0 *)(model + weight_offset);
+    block_q8_0 *w_b = (block_q8_0 *)(model + weight_b_offset);
+    for (uint32_t i = 0; i < heads_count; i++) heads[i] = ((int32_t)(i % 43) - 21) * 0.015625f;
+    for (uint32_t i = 0; i < n_groups * rank * group_dim; i++) w_f32[i] = ((int32_t)(i % 47) - 23) * 0.01171875f;
+    for (uint32_t i = 0; i < out_dim * low_dim; i++) w_b_f32[i] = ((int32_t)(i % 31) - 15) * 0.009765625f;
+    for (uint32_t r = 0; r < n_groups * rank; r++) quantize_row_q8_0(w_f32 + (uint64_t)r * group_dim, w + (uint64_t)r * blocks, group_dim);
+    for (uint32_t r = 0; r < out_dim; r++) quantize_row_q8_0(w_b_f32 + (uint64_t)r * low_dim, w_b + (uint64_t)r * blocks_b, low_dim);
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t g = 0; g < n_groups; g++) {
+            matmul_q8_0_ref(want + (uint64_t)t * n_groups * rank + (uint64_t)g * rank,
+                            w + (uint64_t)g * rank * blocks,
+                            heads + ((uint64_t)t * n_groups + g) * group_dim,
+                            group_dim, rank, 1);
+        }
+    }
+
+    ds4_gpu_tensor *heads_t = ds4_gpu_tensor_alloc((uint64_t)heads_count * sizeof(float));
+    ds4_gpu_tensor *low_t = ds4_gpu_tensor_alloc((uint64_t)low_count * sizeof(float));
+    ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc((uint64_t)n_tokens * out_dim * sizeof(float));
+    int ok = heads_t && low_t && out_t &&
+             ds4_gpu_tensor_write(heads_t, 0, heads, (uint64_t)heads_count * sizeof(float)) &&
+             ds4_gpu_attention_output_q8_batch_tensor(out_t, low_t, NULL, NULL, model, weight_b_offset + weight_b_bytes, weight_offset, weight_b_offset, group_dim, rank, n_groups, out_dim, heads_t, n_tokens) &&
+             ds4_gpu_synchronize() &&
+             ds4_gpu_tensor_read(low_t, 0, got, (uint64_t)low_count * sizeof(float));
+    if (ok) ok = check_close("attention output low q8", want, got, low_count, 1e-2f);
+
+    ds4_gpu_tensor_free(out_t);
+    ds4_gpu_tensor_free(low_t);
+    ds4_gpu_tensor_free(heads_t);
+    free(model); free(heads); free(w_f32); free(w_b_f32); free(want); free(got);
+    return ok;
+}
+
 static int check_quantize(void) {
     const uint32_t rows = 2;
     const uint32_t cols = 512;
@@ -896,7 +954,7 @@ int main(void) {
              check_rms_norm_plain() && check_rms_norm_weight() && check_head_rms_norm() &&
              check_hc_split_sinkhorn() && check_hc_weighted_sum() && check_fp8_kv_quantize() &&
              check_rope_tail() && check_store_raw_kv() && check_attention_prefill_raw() &&
-             check_quantize();
+             check_attention_output_low_q8() && check_quantize();
     if (ok) printf("ascend_fill_smoke: ok\n");
 
     ds4_gpu_cleanup();

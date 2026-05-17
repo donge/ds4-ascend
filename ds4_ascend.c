@@ -133,6 +133,7 @@ extern void ds4_ascend_launch_rope_tail_table(void *stream, void *x, const void 
 extern void ds4_ascend_launch_fp8_kv_quantize(void *stream, void *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot);
 extern void ds4_ascend_launch_store_raw_kv_batch(void *stream, void *raw, const void *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim);
 extern void ds4_ascend_launch_attention_prefill_raw(void *stream, void *heads, const void *sinks, const void *q, const void *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, float scale);
+extern void ds4_ascend_launch_attention_output_low_q8(void *stream, void *low, const void *w, const void *heads, uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens);
 
 static int ascend_ok(aclError err, const char *what) {
     if (err == ACL_ERROR_NONE) return 1;
@@ -1422,53 +1423,32 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(ds4_gpu_tensor *heads, c
 int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, const ds4_gpu_tensor *comp_kv, const ds4_gpu_tensor *comp_mask, uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
     return ascend_attention_prefill_mixed_host(heads, model_map, model_size, sinks_offset, q, raw_kv, comp_kv, comp_mask, 1, n_tokens, n_comp, window, ratio, n_head, head_dim);
 }
-static int ascend_attention_output_low_q8_host(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size, uint64_t out_a_offset, uint64_t group_dim, uint64_t rank, uint32_t n_groups, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+static int ascend_attention_output_low_q8(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size, uint64_t out_a_offset, uint64_t group_dim, uint64_t rank, uint32_t n_groups, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
     if (!low || !model_map || !heads || group_dim == 0 || rank == 0 || n_groups == 0 || n_tokens == 0) return 0;
+    if (group_dim > UINT32_MAX || rank > UINT32_MAX) return 0;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     const uint64_t blocks = (group_dim + DS4_ASCEND_QK8_0 - 1) / DS4_ASCEND_QK8_0;
     const uint64_t row_bytes = blocks * DS4_ASCEND_BLOCK_Q8_0_BYTES;
     const uint64_t weight_bytes = low_dim * row_bytes;
     const uint64_t heads_count = (uint64_t)n_tokens * n_groups * group_dim;
     const uint64_t low_count = (uint64_t)n_tokens * low_dim;
-    if (out_a_offset > model_size || weight_bytes > model_size - out_a_offset ||
-        heads->bytes < heads_count * sizeof(float) || low->bytes < low_count * sizeof(float)) return 0;
-    if (!ascend_host_fallback_begin("attention_output_low_q8", heads_count * sizeof(float), low_count * sizeof(float))) return 0;
-
-    float *heads_host = malloc((size_t)(heads_count * sizeof(float)));
-    float *low_host = malloc((size_t)(low_count * sizeof(float)));
-    ds4_gpu_tensor *group_tensor = ds4_gpu_tensor_alloc((uint64_t)group_dim * sizeof(float));
-    ds4_gpu_tensor *rank_tensor = ds4_gpu_tensor_alloc((uint64_t)rank * sizeof(float));
-    if (!heads_host || !low_host || !group_tensor || !rank_tensor) {
-        free(heads_host); free(low_host); ds4_gpu_tensor_free(group_tensor); ds4_gpu_tensor_free(rank_tensor);
-        return 0;
-    }
-
-    int ok = ds4_gpu_tensor_read(heads, 0, heads_host, heads_count * sizeof(float));
-    if (ok) {
-        for (uint32_t t = 0; t < n_tokens && ok; t++) {
-            for (uint32_t g = 0; g < n_groups && ok; g++) {
-                const float *grp = heads_host + ((uint64_t)t * n_groups + g) * group_dim;
-                const uint64_t group_weight_offset = out_a_offset + ((uint64_t)g * rank) * row_bytes;
-                ok = ds4_gpu_tensor_write(group_tensor, 0, grp, group_dim * sizeof(float)) &&
-                     ascend_matmul_q8_0_tensor(rank_tensor, model_map, model_size, group_weight_offset, group_dim, rank, group_tensor, 1) &&
-                     ds4_gpu_tensor_read(rank_tensor, 0, low_host + (uint64_t)t * low_dim + (uint64_t)g * rank, rank * sizeof(float));
-            }
-        }
-        if (ok) ok = ds4_gpu_tensor_write(low, 0, low_host, low_count * sizeof(float));
-    }
-
-    free(heads_host); free(low_host); ds4_gpu_tensor_free(group_tensor); ds4_gpu_tensor_free(rank_tensor);
-    return ok;
+    if (heads_count > UINT32_MAX || low_count > UINT32_MAX || out_a_offset > model_size || weight_bytes > model_size - out_a_offset ||
+        heads->bytes < heads_count * sizeof(float) || low->bytes < low_count * sizeof(float) || low->device != heads->device) return 0;
+    void *w_dev = ascend_model_range_device_ptr(model_map, model_size, out_a_offset, weight_bytes, heads->device, "attn_out_a");
+    if (!w_dev) return 0;
+    if (!ascend_set_context(heads->device) || !g_streams[heads->device]) return 0;
+    ds4_ascend_launch_attention_output_low_q8(g_streams[heads->device], low->ptr, w_dev, heads->ptr, (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens);
+    return 1;
 }
 
 int ds4_gpu_attention_output_q8_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *low, ds4_gpu_tensor *group_tmp, ds4_gpu_tensor *low_tmp, const void *model_map, uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset, uint64_t group_dim, uint64_t rank, uint32_t n_groups, uint64_t out_dim, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
     const uint64_t low_dim = (uint64_t)n_groups * rank;
-    return ascend_attention_output_low_q8_host(low, model_map, model_size, out_a_offset, group_dim, rank, n_groups, heads, n_tokens) &&
+    return ascend_attention_output_low_q8(low, model_map, model_size, out_a_offset, group_dim, rank, n_groups, heads, n_tokens) &&
            ascend_matmul_q8_0_tensor(out, model_map, model_size, out_b_offset, low_dim, out_dim, low, n_tokens);
 }
 
 int ds4_gpu_attention_output_low_q8_tensor(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size, uint64_t out_a_offset, uint64_t group_dim, uint64_t rank, uint32_t n_groups, const ds4_gpu_tensor *heads) {
-    return ascend_attention_output_low_q8_host(low, model_map, model_size, out_a_offset, group_dim, rank, n_groups, heads, 1);
+    return ascend_attention_output_low_q8(low, model_map, model_size, out_a_offset, group_dim, rank, n_groups, heads, 1);
 }
 int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
     return ascend_swiglu_host(out, gate, up, n, clamp, weight);

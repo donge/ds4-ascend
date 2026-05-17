@@ -506,6 +506,54 @@ extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_attention_prefill
     }
 }
 
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_attention_output_low_q8(GM_ADDR low_gm, GM_ADDR w_gm, GM_ADDR heads_gm, uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> low;
+    GlobalTensor<float> heads;
+    GlobalTensor<uint8_t> w;
+    const uint32_t blocks = (group_dim + DS4_QK8_0 - 1u) / DS4_QK8_0;
+    const uint32_t row_bytes = blocks * DS4_BLOCK_Q8_0_BYTES;
+    const uint32_t low_dim = n_groups * rank;
+    low.SetGlobalBuffer((__gm__ float *)low_gm, n_tokens * low_dim);
+    heads.SetGlobalBuffer((__gm__ float *)heads_gm, n_tokens * n_groups * group_dim);
+    w.SetGlobalBuffer((__gm__ uint8_t *)w_gm, n_groups * rank * row_bytes);
+
+    const uint32_t total = n_tokens * low_dim;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t low_col = gid % low_dim;
+        const uint32_t t = gid / low_dim;
+        const uint32_t g = low_col / rank;
+        const uint32_t r = low_col - g * rank;
+        const uint32_t x_base = (t * n_groups + g) * group_dim;
+        const uint32_t w_base = (g * rank + r) * row_bytes;
+        float acc = 0.0f;
+        for (uint32_t b = 0; b < blocks; b++) {
+            const uint32_t i0 = b * DS4_QK8_0;
+            const uint32_t remain = group_dim - i0;
+            const uint32_t bn = remain < DS4_QK8_0 ? remain : DS4_QK8_0;
+            float amax = 0.0f;
+            for (uint32_t i = 0; i < bn; i++) {
+                const float av = ds4_abs_f32(heads.GetValue(x_base + i0 + i));
+                if (av > amax) amax = av;
+            }
+            const float xd = amax / 127.0f;
+            const float xid = xd != 0.0f ? 1.0f / xd : 0.0f;
+            const uint32_t block_base = w_base + b * DS4_BLOCK_Q8_0_BYTES;
+            const uint16_t wscale_bits = (uint16_t)w.GetValue(block_base) | ((uint16_t)w.GetValue(block_base + 1u) << 8);
+            const float wd = ds4_f16_to_f32(wscale_bits);
+            int32_t dot = 0;
+            for (uint32_t i = 0; i < bn; i++) {
+                int32_t aq = ds4_round_f32_to_i32(heads.GetValue(x_base + i0 + i) * xid);
+                if (aq > 127) aq = 127;
+                if (aq < -128) aq = -128;
+                dot += (int32_t)(int8_t)w.GetValue(block_base + 2u + i) * aq;
+            }
+            acc += wd * xd * (float)dot;
+        }
+        low.SetValue(gid, acc);
+    }
+}
+
 extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_quantize_q8_k(GM_ADDR out_gm, GM_ADDR x_gm, uint32_t rows, uint32_t cols) {
     GlobalTensor<float> x;
     x.SetGlobalBuffer((__gm__ float *)x_gm, rows * cols);
@@ -633,5 +681,12 @@ extern "C" void ds4_ascend_launch_attention_prefill_raw(void *stream, void *head
     const uint32_t parts = 8u;
     for (uint32_t p = 0; p < parts; p++) {
         ds4_attention_prefill_raw<<<1, nullptr, stream>>>((GM_ADDR)heads, (GM_ADDR)sinks, (GM_ADDR)q, (GM_ADDR)raw_kv, n_tokens, window, n_head, head_dim, scale, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_attention_output_low_q8(void *stream, void *low, const void *w, const void *heads, uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_attention_output_low_q8<<<1, nullptr, stream>>>((GM_ADDR)low, (GM_ADDR)w, (GM_ADDR)heads, group_dim, rank, n_groups, n_tokens, p, parts);
     }
 }
