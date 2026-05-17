@@ -202,6 +202,21 @@ static void hc_weighted_sum_ref(float *out, const float *residual, const float *
     }
 }
 
+static void hc_expand_split_ref(float *out, const float *block_out, const float *block_add, const float *residual, const float *split, uint32_t n_embd, uint32_t n_hc, uint32_t rows) {
+    const uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+    for (uint32_t r = 0; r < rows; r++) {
+        const float *post = split + (uint64_t)r * mix_hc + n_hc;
+        const float *comb = split + (uint64_t)r * mix_hc + 2u * n_hc;
+        for (uint32_t dst = 0; dst < n_hc; dst++) {
+            for (uint32_t d = 0; d < n_embd; d++) {
+                float v = (block_out[(uint64_t)r * n_embd + d] + (block_add ? block_add[(uint64_t)r * n_embd + d] : 0.0f)) * post[dst];
+                for (uint32_t src = 0; src < n_hc; src++) v += comb[dst + src * n_hc] * residual[(uint64_t)r * n_hc * n_embd + (uint64_t)src * n_embd + d];
+                out[(uint64_t)r * n_hc * n_embd + (uint64_t)dst * n_embd + d] = v;
+            }
+        }
+    }
+}
+
 static void hc_split_ref(float *out, const float *mix, const float *scale, const float *base, uint32_t rows, uint32_t sinkhorn_iters, float eps) {
     const uint32_t n_hc = 4;
     const uint32_t mix_hc = 24;
@@ -675,6 +690,63 @@ static int check_hc_split_sinkhorn(void) {
     return ok;
 }
 
+static int check_hc_expand_split(void) {
+    const uint32_t rows = 3;
+    const uint32_t n_embd = 17;
+    const uint32_t n_hc = 4;
+    const uint32_t mix_hc = 24;
+    const uint32_t block_count = rows * n_embd;
+    const uint32_t out_count = rows * n_hc * n_embd;
+    const uint32_t split_count = rows * mix_hc;
+    float *block_out = malloc((size_t)block_count * sizeof(float));
+    float *block_add = malloc((size_t)block_count * sizeof(float));
+    float *residual = malloc((size_t)out_count * sizeof(float));
+    float *split = malloc((size_t)split_count * sizeof(float));
+    float *want = malloc((size_t)out_count * sizeof(float));
+    float *got = malloc((size_t)out_count * sizeof(float));
+    if (!block_out || !block_add || !residual || !split || !want || !got) {
+        free(block_out); free(block_add); free(residual); free(split); free(want); free(got);
+        return 0;
+    }
+    for (uint32_t i = 0; i < block_count; i++) {
+        block_out[i] = ((int32_t)(i % 37) - 18) * 0.03125f;
+        block_add[i] = ((int32_t)(i % 29) - 14) * 0.01953125f;
+    }
+    for (uint32_t i = 0; i < out_count; i++) residual[i] = ((int32_t)(i % 41) - 20) * 0.015625f;
+    for (uint32_t i = 0; i < split_count; i++) split[i] = ((int32_t)(i % 23) - 11) * 0.0078125f;
+
+    ds4_gpu_tensor *bo = ds4_gpu_tensor_alloc((uint64_t)block_count * sizeof(float));
+    ds4_gpu_tensor *ba = ds4_gpu_tensor_alloc((uint64_t)block_count * sizeof(float));
+    ds4_gpu_tensor *res = ds4_gpu_tensor_alloc((uint64_t)out_count * sizeof(float));
+    ds4_gpu_tensor *sp = ds4_gpu_tensor_alloc((uint64_t)split_count * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)out_count * sizeof(float));
+    int ok = bo && ba && res && sp && out &&
+             ds4_gpu_tensor_write(bo, 0, block_out, (uint64_t)block_count * sizeof(float)) &&
+             ds4_gpu_tensor_write(ba, 0, block_add, (uint64_t)block_count * sizeof(float)) &&
+             ds4_gpu_tensor_write(res, 0, residual, (uint64_t)out_count * sizeof(float)) &&
+             ds4_gpu_tensor_write(sp, 0, split, (uint64_t)split_count * sizeof(float));
+    if (ok) {
+        hc_expand_split_ref(want, block_out, NULL, residual, split, n_embd, n_hc, rows);
+        ok = ds4_gpu_hc_expand_split_tensor(out, bo, res, sp, n_embd, n_hc) && ds4_gpu_synchronize() &&
+             ds4_gpu_tensor_read(out, 0, got, (uint64_t)out_count * sizeof(float));
+        if (ok) ok = check_close("hc expand split", want, got, out_count, 1e-6f);
+    }
+    if (ok) {
+        hc_expand_split_ref(want, block_out, block_add, residual, split, n_embd, n_hc, rows);
+        ok = ds4_gpu_hc_expand_add_split_tensor(out, bo, ba, res, sp, n_embd, n_hc) && ds4_gpu_synchronize() &&
+             ds4_gpu_tensor_read(out, 0, got, (uint64_t)out_count * sizeof(float));
+        if (ok) ok = check_close("hc expand add split", want, got, out_count, 1e-6f);
+    }
+
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(sp);
+    ds4_gpu_tensor_free(res);
+    ds4_gpu_tensor_free(ba);
+    ds4_gpu_tensor_free(bo);
+    free(block_out); free(block_add); free(residual); free(split); free(want); free(got);
+    return ok;
+}
+
 static int check_fp8_kv_quantize(void) {
     const uint32_t n_tok = 5;
     const uint32_t head_dim = 93;
@@ -952,7 +1024,7 @@ int main(void) {
 
     int ok = check_fill() && check_matmul_f16() && check_matmul_q8_0() &&
              check_rms_norm_plain() && check_rms_norm_weight() && check_head_rms_norm() &&
-             check_hc_split_sinkhorn() && check_hc_weighted_sum() && check_fp8_kv_quantize() &&
+             check_hc_split_sinkhorn() && check_hc_weighted_sum() && check_hc_expand_split() && check_fp8_kv_quantize() &&
              check_rope_tail() && check_store_raw_kv() && check_attention_prefill_raw() &&
              check_attention_output_low_q8() && check_quantize();
     if (ok) printf("ascend_fill_smoke: ok\n");

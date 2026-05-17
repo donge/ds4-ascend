@@ -317,6 +317,40 @@ extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_hc_weighted_sum4(
     }
 }
 
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_hc_expand_split(GM_ADDR out_gm, GM_ADDR block_out_gm, GM_ADDR block_add_gm, GM_ADDR residual_gm, GM_ADDR split_gm, uint32_t n_embd, uint32_t n_hc, uint32_t rows, uint32_t has_add, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> out;
+    GlobalTensor<float> block_out;
+    GlobalTensor<float> block_add;
+    GlobalTensor<float> residual;
+    GlobalTensor<float> split;
+    const uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+    out.SetGlobalBuffer((__gm__ float *)out_gm, rows * n_hc * n_embd);
+    block_out.SetGlobalBuffer((__gm__ float *)block_out_gm, rows * n_embd);
+    if (has_add) block_add.SetGlobalBuffer((__gm__ float *)block_add_gm, rows * n_embd);
+    residual.SetGlobalBuffer((__gm__ float *)residual_gm, rows * n_hc * n_embd);
+    split.SetGlobalBuffer((__gm__ float *)split_gm, rows * mix_hc);
+
+    const uint32_t total = rows * n_hc * n_embd;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t d = gid % n_embd;
+        const uint32_t tmp = gid / n_embd;
+        const uint32_t dst = tmp % n_hc;
+        const uint32_t r = tmp / n_hc;
+        const uint32_t block_idx = r * n_embd + d;
+        const uint32_t split_base = r * mix_hc;
+        float block_v = block_out.GetValue(block_idx);
+        if (has_add) block_v += block_add.GetValue(block_idx);
+        float acc = block_v * split.GetValue(split_base + n_hc + dst);
+        const uint32_t res_base = r * n_hc * n_embd + d;
+        const uint32_t comb_base = split_base + 2u * n_hc + dst;
+        for (uint32_t src = 0; src < n_hc; src++) {
+            acc += split.GetValue(comb_base + src * n_hc) * residual.GetValue(res_base + src * n_embd);
+        }
+        out.SetValue(gid, acc);
+    }
+}
+
 extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_hc_split_sinkhorn4(GM_ADDR out_gm, GM_ADDR mix_gm, GM_ADDR scale_gm, GM_ADDR base_gm, uint32_t rows, uint32_t sinkhorn_iters, float eps, uint32_t start_row, uint32_t stride) {
     GlobalTensor<float> out;
     GlobalTensor<float> mix;
@@ -639,6 +673,13 @@ extern "C" void ds4_ascend_launch_rms_norm_inplace(void *stream, void *x, uint32
     const float inv_n = 1.0f / (float)n;
     for (uint32_t p = 0; p < parts; p++) {
         ds4_rms_norm_inplace<<<1, nullptr, stream>>>((GM_ADDR)x, n, rows, inv_n, eps, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_hc_expand_split(void *stream, void *out, const void *block_out, const void *block_add, const void *residual, const void *split, uint32_t n_embd, uint32_t n_hc, uint32_t rows, uint32_t has_add) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_hc_expand_split<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)block_out, (GM_ADDR)block_add, (GM_ADDR)residual, (GM_ADDR)split, n_embd, n_hc, rows, has_add, p, parts);
     }
 }
 

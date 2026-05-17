@@ -127,6 +127,7 @@ extern void ds4_ascend_launch_matmul_q8_0(void *stream, void *out, const void *w
 extern void ds4_ascend_launch_rms_norm_plain(void *stream, void *out, const void *x, uint32_t n, uint32_t rows, float eps);
 extern void ds4_ascend_launch_rms_norm_weight(void *stream, void *out, const void *x, const void *weight, uint32_t n, uint32_t rows, float eps);
 extern void ds4_ascend_launch_rms_norm_inplace(void *stream, void *x, uint32_t n, uint32_t rows, float eps);
+extern void ds4_ascend_launch_hc_expand_split(void *stream, void *out, const void *block_out, const void *block_add, const void *residual, const void *split, uint32_t n_embd, uint32_t n_hc, uint32_t rows, uint32_t has_add);
 extern void ds4_ascend_launch_hc_split_sinkhorn4(void *stream, void *out, const void *mix, const void *scale, const void *base, uint32_t rows, uint32_t sinkhorn_iters, float eps);
 extern void ds4_ascend_launch_hc_weighted_sum4(void *stream, void *out, const void *residual, const void *weights, uint32_t n_embd, uint32_t rows, uint32_t weight_stride);
 extern void ds4_ascend_launch_rope_tail_table(void *stream, void *x, const void *table, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot);
@@ -1933,57 +1934,24 @@ int ds4_gpu_output_hc_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
     return ok;
 }
 
-static int ascend_hc_expand_split_host(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+static int ascend_hc_expand_split(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     const uint32_t mix_hc = ascend_hc_mix_count(n_hc);
     const uint64_t rows = block_out->bytes / ((uint64_t)n_embd * sizeof(float));
-    if (rows == 0 || out_hc->bytes < rows * n_hc * (uint64_t)n_embd * sizeof(float) ||
-        residual_hc->bytes < rows * n_hc * (uint64_t)n_embd * sizeof(float) ||
-        split->bytes < rows * (uint64_t)mix_hc * sizeof(float) ||
-        (block_add && block_add->bytes < rows * (uint64_t)n_embd * sizeof(float))) return 0;
+    const uint64_t out_count = rows * n_hc * (uint64_t)n_embd;
     const uint64_t block_count = rows * (uint64_t)n_embd;
-    const uint64_t residual_count = rows * n_hc * (uint64_t)n_embd;
     const uint64_t split_count = rows * (uint64_t)mix_hc;
-    const uint64_t expand_to_host = (block_count + residual_count + split_count + (block_add ? block_count : 0u)) * sizeof(float);
-    const uint64_t expand_to_device = residual_count * sizeof(float);
-    if (!ascend_host_fallback_begin(block_add ? "hc_expand_add_split" : "hc_expand_split", expand_to_host, expand_to_device)) return 0;
-    float *bo = malloc((size_t)(rows * (uint64_t)n_embd * sizeof(float)));
-    float *ba = block_add ? malloc((size_t)(rows * (uint64_t)n_embd * sizeof(float))) : NULL;
-    float *res = malloc((size_t)(rows * n_hc * (uint64_t)n_embd * sizeof(float)));
-    float *sp = malloc((size_t)(rows * (uint64_t)mix_hc * sizeof(float)));
-    float *oh = malloc((size_t)(rows * n_hc * (uint64_t)n_embd * sizeof(float)));
-    if (!bo || (block_add && !ba) || !res || !sp || !oh) {
-        free(bo); free(ba); free(res); free(sp); free(oh);
-        return 0;
-    }
-    int ok = ds4_gpu_tensor_read(block_out, 0, bo, rows * (uint64_t)n_embd * sizeof(float)) &&
-             ds4_gpu_tensor_read(residual_hc, 0, res, rows * n_hc * (uint64_t)n_embd * sizeof(float)) &&
-             ds4_gpu_tensor_read(split, 0, sp, rows * (uint64_t)mix_hc * sizeof(float));
-    if (ok && block_add) ok = ds4_gpu_tensor_read(block_add, 0, ba, rows * (uint64_t)n_embd * sizeof(float));
-    if (ok) {
-        for (uint64_t r = 0; r < rows; r++) {
-            const float *post = sp + r * mix_hc + n_hc;
-            const float *comb = sp + r * mix_hc + 2u * n_hc;
-            const float *resr = res + r * n_hc * (uint64_t)n_embd;
-            const float *bor = bo + r * n_embd;
-            const float *bar = ba ? ba + r * n_embd : NULL;
-            float *ohr = oh + r * n_hc * (uint64_t)n_embd;
-            for (uint32_t dst = 0; dst < n_hc; dst++) {
-                for (uint32_t d = 0; d < n_embd; d++) {
-                    float v = (bor[d] + (bar ? bar[d] : 0.0f)) * post[dst];
-                    for (uint32_t src = 0; src < n_hc; src++) v += comb[dst + src * n_hc] * resr[(uint64_t)src * n_embd + d];
-                    ohr[(uint64_t)dst * n_embd + d] = v;
-                }
-            }
-        }
-        ok = ds4_gpu_tensor_write(out_hc, 0, oh, rows * n_hc * (uint64_t)n_embd * sizeof(float));
-    }
-    free(bo); free(ba); free(res); free(sp); free(oh);
-    return ok;
+    if (rows == 0 || rows > UINT32_MAX || out_count > UINT32_MAX ||
+        out_hc->bytes < out_count * sizeof(float) || residual_hc->bytes < out_count * sizeof(float) || split->bytes < split_count * sizeof(float) ||
+        (block_add && block_add->bytes < block_count * sizeof(float)) || out_hc->device != block_out->device || out_hc->device != residual_hc->device ||
+        out_hc->device != split->device || (block_add && out_hc->device != block_add->device)) return 0;
+    if (!ascend_set_context(out_hc->device) || !g_streams[out_hc->device]) return 0;
+    ds4_ascend_launch_hc_expand_split(g_streams[out_hc->device], out_hc->ptr, block_out->ptr, block_add ? block_add->ptr : NULL, residual_hc->ptr, split->ptr, n_embd, n_hc, (uint32_t)rows, block_add ? 1u : 0u);
+    return 1;
 }
 
 int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc) { return ascend_unimplemented(__func__); }
-int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) { return ascend_hc_expand_split_host(out_hc, block_out, NULL, residual_hc, split, n_embd, n_hc); }
-int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) { return ascend_hc_expand_split_host(out_hc, block_out, block_add, residual_hc, split, n_embd, n_hc); }
+int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) { return ascend_hc_expand_split(out_hc, block_out, NULL, residual_hc, split, n_embd, n_hc); }
+int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) { return ascend_hc_expand_split(out_hc, block_out, block_add, residual_hc, split, n_embd, n_hc); }
 int ds4_gpu_shared_down_hc_expand_q8_0_tensor(ds4_gpu_tensor *out_hc, ds4_gpu_tensor *shared_out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *shared_mid, const ds4_gpu_tensor *routed_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) { return ascend_unimplemented(__func__); }
 int ds4_gpu_matmul_q8_0_hc_expand_tensor(ds4_gpu_tensor *out_hc, ds4_gpu_tensor *block_out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) { return ascend_unimplemented(__func__); }
