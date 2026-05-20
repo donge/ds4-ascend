@@ -131,6 +131,8 @@ extern void ds4_ascend_launch_add_f32(void *stream, void *out, const void *a, co
 extern void ds4_ascend_launch_quantize_q8_k(void *stream, void *out, const void *x, uint32_t rows, uint32_t cols);
 extern void ds4_ascend_launch_matmul_f16(void *stream, void *out, const void *w, const void *x, uint32_t in_dim, uint32_t out_dim, uint32_t n_tok);
 extern void ds4_ascend_launch_matmul_q8_0(void *stream, void *out, const void *w, const void *x, uint32_t in_dim, uint32_t out_dim, uint32_t n_tok);
+extern void ds4_ascend_launch_quantize_q8_0(void *stream, void *xq, void *xscale, const void *x, uint32_t in_dim, uint32_t n_tok);
+extern void ds4_ascend_launch_matmul_q8_0_prequant(void *stream, void *out, const void *w, const void *xq, const void *xscale, uint32_t in_dim, uint32_t out_dim, uint32_t n_tok);
 extern void ds4_ascend_launch_embed_token_hc(void *stream, void *out, const void *w, uint32_t token, uint32_t n_embd, uint32_t n_hc);
 extern void ds4_ascend_launch_embed_tokens_hc(void *stream, void *out, const void *tokens, const void *w, uint32_t n_vocab, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc);
 extern void ds4_ascend_launch_rms_norm_plain(void *stream, void *out, const void *x, uint32_t n, uint32_t rows, float eps);
@@ -1062,8 +1064,20 @@ static int ascend_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map,
     void *w_dev = ascend_model_range_device_ptr(model_map, model_size, weight_offset, weight_bytes, x->device, "matmul_q8_0");
     if (!w_dev) return 0;
     if (!ascend_set_context(x->device) || !g_streams[x->device]) return 0;
-    ds4_ascend_launch_matmul_q8_0(g_streams[x->device], out->ptr, w_dev, x->ptr, (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
-    return 1;
+    const uint64_t xq_bytes = n_tok * blocks * DS4_ASCEND_QK8_0;
+    const uint64_t xscale_bytes = n_tok * blocks * sizeof(float);
+    ds4_gpu_tensor *xq = ascend_tensor_alloc_on_device(xq_bytes, x->device);
+    ds4_gpu_tensor *xscale = ascend_tensor_alloc_on_device(xscale_bytes, x->device);
+    if (!xq || !xscale) {
+        ds4_gpu_tensor_free(xq);
+        ds4_gpu_tensor_free(xscale);
+        return 0;
+    }
+    ds4_ascend_launch_quantize_q8_0(g_streams[x->device], xq->ptr, xscale->ptr, x->ptr, (uint32_t)in_dim, (uint32_t)n_tok);
+    ds4_ascend_launch_matmul_q8_0_prequant(g_streams[x->device], out->ptr, w_dev, xq->ptr, xscale->ptr, (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+    int ok = ascend_defer_free_tensor(xq);
+    ok = ascend_defer_free_tensor(xscale) && ok;
+    return ok;
 }
 
 int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {

@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <math.h>
+#include <stdlib.h>
 
 using namespace AscendC;
 
@@ -10,6 +11,30 @@ using namespace AscendC;
 #define DS4_BLOCK_Q8_0_BYTES 34u
 #define DS4_N_EXPERT 256u
 #define DS4_N_EXPERT_USED 6u
+#define DS4_ASCEND_DEFAULT_KERNEL_PARTS 32u
+#define DS4_ASCEND_MAX_KERNEL_PARTS 64u
+
+static uint32_t ds4_ascend_parse_parts(const char *name, uint32_t fallback) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return fallback;
+    char *end = nullptr;
+    unsigned long v = strtoul(env, &end, 10);
+    if (end == env || v == 0) v = fallback;
+    if (v > DS4_ASCEND_MAX_KERNEL_PARTS) v = DS4_ASCEND_MAX_KERNEL_PARTS;
+    return (uint32_t)v;
+}
+
+static uint32_t ds4_ascend_kernel_parts(void) {
+    static uint32_t cached = 0;
+    if (!cached) cached = ds4_ascend_parse_parts("DS4_ASCEND_KERNEL_PARTS", DS4_ASCEND_DEFAULT_KERNEL_PARTS);
+    return cached;
+}
+
+static uint32_t ds4_ascend_matmul_q8_0_parts(void) {
+    static uint32_t cached = 0;
+    if (!cached) cached = ds4_ascend_parse_parts("DS4_ASCEND_MATMUL_Q8_0_PARTS", ds4_ascend_kernel_parts());
+    return cached;
+}
 
 typedef struct {
     uint8_t scales[DS4_QK_K / 16];
@@ -349,6 +374,81 @@ extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_embed_tokens_hc(G
         int32_t tok = tokens.GetValue(t);
         if (tok < 0 || tok >= (int32_t)n_vocab) tok = 0;
         out.SetValue(gid, ds4_f16_to_f32(w.GetValue((uint32_t)tok * n_embd + d)));
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_quantize_q8_0(GM_ADDR xq_gm, GM_ADDR xscale_gm, GM_ADDR x_gm, uint32_t in_dim, uint32_t n_tok, uint32_t start_block, uint32_t stride) {
+    GlobalTensor<float> x;
+    GlobalTensor<float> xscale;
+    GlobalTensor<uint8_t> xq;
+    x.SetGlobalBuffer((__gm__ float *)x_gm, n_tok * in_dim);
+    const uint32_t blocks = (in_dim + DS4_QK8_0 - 1u) / DS4_QK8_0;
+    xq.SetGlobalBuffer((__gm__ uint8_t *)xq_gm, n_tok * blocks * DS4_QK8_0);
+    xscale.SetGlobalBuffer((__gm__ float *)xscale_gm, n_tok * blocks);
+
+    const uint32_t total = n_tok * blocks;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_block; gid < total; gid += stride) {
+        const uint32_t t = gid / blocks;
+        const uint32_t b = gid - t * blocks;
+        const uint32_t i0 = b * DS4_QK8_0;
+        const uint32_t remain = in_dim - i0;
+        const uint32_t bn = remain < DS4_QK8_0 ? remain : DS4_QK8_0;
+        const uint32_t x_base = t * in_dim + i0;
+        const uint32_t q_base = (t * blocks + b) * DS4_QK8_0;
+        float amax = 0.0f;
+        for (uint32_t i = 0; i < bn; i++) {
+            const float av = ds4_abs_f32(x.GetValue(x_base + i));
+            if (av > amax) amax = av;
+        }
+        const float xd = amax / 127.0f;
+        const float xid = xd != 0.0f ? 1.0f / xd : 0.0f;
+        xscale.SetValue(gid, xd);
+        for (uint32_t i = 0; i < DS4_QK8_0; i++) {
+            int32_t aq = 0;
+            if (i < bn) {
+                aq = ds4_round_f32_to_i32(x.GetValue(x_base + i) * xid);
+                if (aq > 127) aq = 127;
+                if (aq < -128) aq = -128;
+            }
+            xq.SetValue(q_base + i, (uint8_t)(int8_t)aq);
+        }
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_matmul_q8_0_prequant(GM_ADDR out_gm, GM_ADDR w_gm, GM_ADDR xq_gm, GM_ADDR xscale_gm, uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> out;
+    GlobalTensor<float> xscale;
+    GlobalTensor<uint8_t> w;
+    GlobalTensor<uint8_t> xq;
+    out.SetGlobalBuffer((__gm__ float *)out_gm, n_tok * out_dim);
+    const uint32_t blocks = (in_dim + DS4_QK8_0 - 1u) / DS4_QK8_0;
+    const uint32_t row_bytes = blocks * DS4_BLOCK_Q8_0_BYTES;
+    w.SetGlobalBuffer((__gm__ uint8_t *)w_gm, out_dim * row_bytes);
+    xq.SetGlobalBuffer((__gm__ uint8_t *)xq_gm, n_tok * blocks * DS4_QK8_0);
+    xscale.SetGlobalBuffer((__gm__ float *)xscale_gm, n_tok * blocks);
+
+    const uint32_t total = n_tok * out_dim;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t t = gid / out_dim;
+        const uint32_t r = gid - t * out_dim;
+        const uint32_t xq_base = t * blocks * DS4_QK8_0;
+        const uint32_t scale_base = t * blocks;
+        const uint32_t w_base = r * row_bytes;
+        float acc = 0.0f;
+        for (uint32_t b = 0; b < blocks; b++) {
+            const uint32_t w_block_base = w_base + b * DS4_BLOCK_Q8_0_BYTES;
+            const uint16_t wscale_bits = (uint16_t)w.GetValue(w_block_base) | ((uint16_t)w.GetValue(w_block_base + 1u) << 8);
+            const float xd = xscale.GetValue(scale_base + b);
+            const float wd = ds4_f16_to_f32(wscale_bits);
+            int32_t dot = 0;
+            for (uint32_t i = 0; i < DS4_QK8_0; i++) {
+                dot += (int32_t)(int8_t)w.GetValue(w_block_base + 2u + i) * (int32_t)(int8_t)xq.GetValue(xq_base + b * DS4_QK8_0 + i);
+            }
+            acc += wd * xd * (float)dot;
+        }
+        out.SetValue(gid, acc);
     }
 }
 
@@ -984,13 +1084,14 @@ extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_attention_output_
     }
 }
 
-extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_quantize_q8_k(GM_ADDR out_gm, GM_ADDR x_gm, uint32_t rows, uint32_t cols) {
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_quantize_q8_k(GM_ADDR out_gm, GM_ADDR x_gm, uint32_t rows, uint32_t cols, uint32_t start_block, uint32_t stride) {
     GlobalTensor<float> x;
     x.SetGlobalBuffer((__gm__ float *)x_gm, rows * cols);
 
     __gm__ ds4_block_q8_K *out = (__gm__ ds4_block_q8_K *)out_gm;
     const uint32_t blocks = rows * (cols / DS4_QK_K);
-    for (uint32_t b = 0; b < blocks; b++) {
+    if (stride == 0) stride = 1;
+    for (uint32_t b = start_block; b < blocks; b += stride) {
         const uint32_t base = b * DS4_QK_K;
         float max = 0.0f;
         float amax = 0.0f;
@@ -1342,18 +1443,21 @@ extern "C" void ds4_ascend_launch_fill_f32(void *stream, void *out, float value,
 }
 
 extern "C" void ds4_ascend_launch_add_f32(void *stream, void *out, const void *a, const void *b, uint32_t count) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_add_f32<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)a, (GM_ADDR)b, count, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_quantize_q8_k(void *stream, void *out, const void *x, uint32_t rows, uint32_t cols) {
-    ds4_quantize_q8_k<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)x, rows, cols);
+    const uint32_t parts = ds4_ascend_kernel_parts();
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_quantize_q8_k<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)x, rows, cols, p, parts);
+    }
 }
 
 extern "C" void ds4_ascend_launch_moe_gate_up_mid_iq2_q8(void *stream, void *gate_out, void *up_out, void *mid_out, const void *gate_w, const void *up_w, const void *xq, const void *selected, const void *weights, const void *ksigns, const void *grid, uint32_t pair_count, uint32_t n_expert, uint32_t expert_begin, uint32_t expert_count, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, float clamp) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     const uint32_t gate_expert_blocks = (uint32_t)(gate_expert_bytes / sizeof(ds4_block_iq2_xxs));
     const uint32_t gate_row_blocks = (uint32_t)(gate_row_bytes / sizeof(ds4_block_iq2_xxs));
     for (uint32_t p = 0; p < parts; p++) {
@@ -1362,7 +1466,7 @@ extern "C" void ds4_ascend_launch_moe_gate_up_mid_iq2_q8(void *stream, void *gat
 }
 
 extern "C" void ds4_ascend_launch_moe_down_q2_q8(void *stream, void *experts_out, const void *down_w, const void *midq, const void *selected, uint32_t pair_count, uint32_t expert_begin, uint32_t expert_count, uint32_t expert_mid_dim, uint32_t out_dim, uint64_t down_expert_bytes, uint64_t down_row_bytes) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     const uint32_t down_expert_blocks = (uint32_t)(down_expert_bytes / sizeof(ds4_block_q2_K));
     const uint32_t down_row_blocks = (uint32_t)(down_row_bytes / sizeof(ds4_block_q2_K));
     for (uint32_t p = 0; p < parts; p++) {
@@ -1371,84 +1475,98 @@ extern "C" void ds4_ascend_launch_moe_down_q2_q8(void *stream, void *experts_out
 }
 
 extern "C" void ds4_ascend_launch_moe_merge_width(void *stream, void *dst, const void *src, const void *selected, uint32_t pair_count, uint32_t width, uint32_t expert_begin, uint32_t expert_count) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_moe_merge_width<<<1, nullptr, stream>>>((GM_ADDR)dst, (GM_ADDR)src, (GM_ADDR)selected, pair_count, width, expert_begin, expert_count, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_moe_sum_experts(void *stream, void *out, const void *experts, uint32_t n_tokens, uint32_t n_expert, uint32_t out_dim) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_moe_sum_experts<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)experts, n_tokens, n_expert, out_dim, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_swiglu(void *stream, void *out, const void *gate, const void *up, uint32_t n, float clamp, float weight) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_swiglu<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)gate, (GM_ADDR)up, n, clamp, weight, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_compressor_set_rows(void *stream, void *state_kv, void *state_score, const void *kv, const void *sc, const void *ape, uint32_t ape_type, uint32_t width, uint32_t ratio, uint32_t pos0, uint32_t src0, uint32_t dst0, uint32_t rows) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_compressor_set_rows<<<1, nullptr, stream>>>((GM_ADDR)state_kv, (GM_ADDR)state_score, (GM_ADDR)kv, (GM_ADDR)sc, (GM_ADDR)ape, ape_type, width, ratio, pos0, src0, dst0, rows, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_compressor_prefill_pool(void *stream, void *comp, const void *kv, const void *sc, const void *state_kv, const void *state_score, const void *ape, uint32_t ape_type, uint32_t head_dim, uint32_t ratio, uint32_t pos0, uint32_t n_comp, uint32_t replay) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_compressor_prefill_pool<<<1, nullptr, stream>>>((GM_ADDR)comp, (GM_ADDR)kv, (GM_ADDR)sc, (GM_ADDR)state_kv, (GM_ADDR)state_score, (GM_ADDR)ape, ape_type, head_dim, ratio, pos0, n_comp, replay, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_compressor_update_pool(void *stream, void *row, const void *state_kv, const void *state_score, uint32_t head_dim, uint32_t ratio) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_compressor_update_pool<<<1, nullptr, stream>>>((GM_ADDR)row, (GM_ADDR)state_kv, (GM_ADDR)state_score, head_dim, ratio, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_compressor_shift_ratio4(void *stream, void *state_kv, void *state_score, uint32_t width) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_compressor_shift_ratio4<<<1, nullptr, stream>>>((GM_ADDR)state_kv, (GM_ADDR)state_score, width, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_matmul_f16(void *stream, void *out, const void *w, const void *x, uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_matmul_f16<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)w, (GM_ADDR)x, in_dim, out_dim, n_tok, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_embed_token_hc(void *stream, void *out, const void *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_embed_token_hc<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)w, token, n_embd, n_hc, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_embed_tokens_hc(void *stream, void *out, const void *tokens, const void *w, uint32_t n_vocab, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_embed_tokens_hc<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)tokens, (GM_ADDR)w, n_vocab, n_tokens, n_embd, n_hc, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_matmul_q8_0(void *stream, void *out, const void *w, const void *x, uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_matmul_q8_0_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_matmul_q8_0<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)w, (GM_ADDR)x, in_dim, out_dim, n_tok, p, parts);
     }
 }
 
+extern "C" void ds4_ascend_launch_quantize_q8_0(void *stream, void *xq, void *xscale, const void *x, uint32_t in_dim, uint32_t n_tok) {
+    const uint32_t parts = ds4_ascend_kernel_parts();
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_quantize_q8_0<<<1, nullptr, stream>>>((GM_ADDR)xq, (GM_ADDR)xscale, (GM_ADDR)x, in_dim, n_tok, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_matmul_q8_0_prequant(void *stream, void *out, const void *w, const void *xq, const void *xscale, uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    const uint32_t parts = ds4_ascend_matmul_q8_0_parts();
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_matmul_q8_0_prequant<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)w, (GM_ADDR)xq, (GM_ADDR)xscale, in_dim, out_dim, n_tok, p, parts);
+    }
+}
+
 extern "C" void ds4_ascend_launch_rms_norm_plain(void *stream, void *out, const void *x, uint32_t n, uint32_t rows, float eps) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     const float inv_n = 1.0f / (float)n;
     for (uint32_t p = 0; p < parts; p++) {
         ds4_rms_norm_plain<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)x, n, rows, inv_n, eps, p, parts);
@@ -1456,7 +1574,7 @@ extern "C" void ds4_ascend_launch_rms_norm_plain(void *stream, void *out, const 
 }
 
 extern "C" void ds4_ascend_launch_rms_norm_weight(void *stream, void *out, const void *x, const void *weight, uint32_t n, uint32_t rows, float eps) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     const float inv_n = 1.0f / (float)n;
     for (uint32_t p = 0; p < parts; p++) {
         ds4_rms_norm_weight<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)x, (GM_ADDR)weight, n, rows, inv_n, eps, p, parts);
@@ -1464,7 +1582,7 @@ extern "C" void ds4_ascend_launch_rms_norm_weight(void *stream, void *out, const
 }
 
 extern "C" void ds4_ascend_launch_rms_norm_inplace(void *stream, void *x, uint32_t n, uint32_t rows, float eps) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     const float inv_n = 1.0f / (float)n;
     for (uint32_t p = 0; p < parts; p++) {
         ds4_rms_norm_inplace<<<1, nullptr, stream>>>((GM_ADDR)x, n, rows, inv_n, eps, p, parts);
@@ -1472,91 +1590,91 @@ extern "C" void ds4_ascend_launch_rms_norm_inplace(void *stream, void *x, uint32
 }
 
 extern "C" void ds4_ascend_launch_router_select(void *stream, void *selected, void *weights, void *probs, const void *bias, const void *hash, const void *logits, const void *tokens, int32_t token_scalar, uint32_t hash_rows, uint32_t n_tokens, uint32_t has_bias, uint32_t hash_mode) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_router_select<<<1, nullptr, stream>>>((GM_ADDR)selected, (GM_ADDR)weights, (GM_ADDR)probs, (GM_ADDR)bias, (GM_ADDR)hash, (GM_ADDR)logits, (GM_ADDR)tokens, token_scalar, hash_rows, n_tokens, has_bias, hash_mode, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_hc_expand_split(void *stream, void *out, const void *block_out, const void *block_add, const void *residual, const void *split, uint32_t n_embd, uint32_t n_hc, uint32_t rows, uint32_t has_add) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_hc_expand_split<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)block_out, (GM_ADDR)block_add, (GM_ADDR)residual, (GM_ADDR)split, n_embd, n_hc, rows, has_add, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_hc_expand(void *stream, void *out, const void *block_out, const void *residual, const void *post, const void *comb, uint32_t n_embd, uint32_t n_hc, uint32_t rows) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_hc_expand<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)block_out, (GM_ADDR)residual, (GM_ADDR)post, (GM_ADDR)comb, n_embd, n_hc, rows, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_hc_split_sinkhorn4(void *stream, void *out, const void *mix, const void *scale, const void *base, uint32_t rows, uint32_t sinkhorn_iters, float eps) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_hc_split_sinkhorn4<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)mix, (GM_ADDR)scale, (GM_ADDR)base, rows, sinkhorn_iters, eps, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_hc_weighted_sum4(void *stream, void *out, const void *residual, const void *weights, uint32_t n_embd, uint32_t rows, uint32_t weight_stride) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_hc_weighted_sum4<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)residual, (GM_ADDR)weights, n_embd, rows, weight_stride, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_output_hc_weights(void *stream, void *out, const void *pre, const void *scale, const void *base, uint32_t n_hc, uint32_t n_tokens, float eps) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_output_hc_weights<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)pre, (GM_ADDR)scale, (GM_ADDR)base, n_hc, n_tokens, eps, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_rope_tail_table(void *stream, void *x, const void *table, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_rope_tail_table<<<1, nullptr, stream>>>((GM_ADDR)x, (GM_ADDR)table, n_tok, n_head, head_dim, n_rot, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_fp8_kv_quantize(void *stream, void *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_fp8_kv_quantize<<<1, nullptr, stream>>>((GM_ADDR)x, n_tok, head_dim, n_rot, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_store_raw_kv_batch(void *stream, void *raw, const void *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_store_raw_kv_batch<<<1, nullptr, stream>>>((GM_ADDR)raw, (GM_ADDR)kv, raw_cap, pos0, n_tokens, head_dim, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_attention_prefill_raw(void *stream, void *heads, const void *sinks, const void *q, const void *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, float scale) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_attention_prefill_raw<<<1, nullptr, stream>>>((GM_ADDR)heads, (GM_ADDR)sinks, (GM_ADDR)q, (GM_ADDR)raw_kv, n_tokens, window, n_head, head_dim, scale, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_attention_decode(void *stream, void *heads, const void *sinks, const void *q, const void *raw_kv, const void *comp_kv, const void *comp_mask, uint32_t use_comp_mask, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t n_head, uint32_t head_dim, float scale) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_attention_decode<<<1, nullptr, stream>>>((GM_ADDR)heads, (GM_ADDR)sinks, (GM_ADDR)q, (GM_ADDR)raw_kv, (GM_ADDR)comp_kv, (GM_ADDR)comp_mask, use_comp_mask, n_raw, raw_cap, raw_start, n_comp, n_head, head_dim, scale, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_attention_prefill_mixed(void *stream, void *heads, const void *sinks, const void *q, const void *raw_kv, const void *comp_kv, const void *comp_mask, uint32_t use_comp_mask, uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim, float scale) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_attention_prefill_mixed<<<1, nullptr, stream>>>((GM_ADDR)heads, (GM_ADDR)sinks, (GM_ADDR)q, (GM_ADDR)raw_kv, (GM_ADDR)comp_kv, (GM_ADDR)comp_mask, use_comp_mask, n_tokens, n_comp, window, ratio, n_head, head_dim, scale, p, parts);
     }
 }
 
 extern "C" void ds4_ascend_launch_attention_output_low_q8(void *stream, void *low, const void *w, const void *heads, uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens) {
-    const uint32_t parts = 8u;
+    const uint32_t parts = ds4_ascend_kernel_parts();
     for (uint32_t p = 0; p < parts; p++) {
         ds4_attention_output_low_q8<<<1, nullptr, stream>>>((GM_ADDR)low, (GM_ADDR)w, (GM_ADDR)heads, group_dim, rank, n_groups, n_tokens, p, parts);
     }

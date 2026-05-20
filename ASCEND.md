@@ -157,15 +157,19 @@ prefill, not steady-state decode:
 - Expert sharding startup prepares about `72.56 GiB` of q2 tensors and has been
   observed at roughly `135-146s`.
 - Layer-major prefill still runs all 43 layers even for a tiny prompt.
-- Profiling with the current correctness-first kernels showed representative
-  per-layer costs around `97-105s` for prefill attention and around `23s` for FFN
-  execution.
-- Because the current kernels are direct correctness ports, printed `0.00 t/s`
+- Profiling before the first optimization pass showed the largest costs in Q8_0
+  projections: attention output projection, attention `q_b`, and shared expert
+  projections.
+- The first validated optimization prequantizes each Q8_0 activation once and
+  reuses the int8 activation plus float scale for all output rows. This keeps the
+  layer-0 graph diff at the established baseline while reducing graph smoke wall
+  time from roughly `207-215s` to `161s` on the tested Atlas system.
+- Because many kernels are still direct correctness ports, printed `0.00 t/s`
   values on very short runs are not useful steady-state throughput numbers.
 
 Decode throughput must be interpreted from longer generation runs after startup
 and prefill complete. The current Ascend backend should be treated as runnable
-and correctness-gated, but not yet performance optimized.
+and correctness-gated, with only an initial Q8_0 projection optimization applied.
 
 ## Known non-goals for this stage
 
@@ -199,6 +203,6 @@ Optimization plan after the longer correctness smoke passes:
 4. Reuse short-lived RoPE and temporary buffers instead of allocating them per
    operation.
 5. Continue profiling compressor prefill, output head, and router/MoE kernels
-   once attention and FFN are no longer the dominant bottlenecks.
+   after the Q8_0 prequantization improvement.
 6. Consider making the Ascend link dependency set permanent in `Makefile` if the
    project keeps targeting CANN 9.0.
