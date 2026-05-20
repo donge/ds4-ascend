@@ -210,3 +210,20 @@ export DS4_ASCEND_NO_HOST_FALLBACK=1
   - AscendC kernels 和 launch wrappers。
 - `ASCEND.md`
   - 更详细的 Ascend backend 状态、实现约束、验证方式和优化方向。
+
+## 参考项目和资料
+
+本仓库基于和参考了以下项目、资料与生态：
+
+- [antirez/ds4](https://github.com/antirez/ds4)
+  - 原始 DS4 项目，本仓库的 DeepSeek V4 Flash loader、graph path、CLI、server、KV cache 和测试体系都来自这里。
+- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
+  - GGUF、GGML、量化格式和本地大模型推理工程实践的重要参考。
+- [ggml-org/ggml](https://github.com/ggml-org/ggml)
+  - GGML tensor/quantization 生态来源，DS4 中部分 GGUF/quant layout 语义与其兼容。
+- [DeepSeek V4 Flash encoding documentation](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md)
+  - DeepSeek DSML/tool calling 和 tokenizer/template 行为的参考资料。
+- [Huawei Ascend CANN documentation](https://www.hiascend.com/document)
+  - AscendCL、CANN runtime、AscendC kernel 开发和 Atlas 设备运行环境参考。
+
+如果只想理解本仓库相对原 DS4 做了什么，优先阅读本文的“基于原 DS4 项目的主要改动”和 [ASCEND.md](ASCEND.md)。
