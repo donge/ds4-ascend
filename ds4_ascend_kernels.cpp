@@ -12,17 +12,33 @@ using namespace AscendC;
 #define DS4_N_EXPERT_USED 6u
 
 typedef struct {
+    uint8_t scales[DS4_QK_K / 16];
+    uint8_t qs[DS4_QK_K / 4];
+    uint16_t d;
+    uint16_t dmin;
+} ds4_block_q2_K;
+
+typedef struct {
     float d;
     int8_t qs[DS4_QK_K];
     int16_t bsums[DS4_QK_K / 16];
 } ds4_block_q8_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t qs[DS4_QK_K / 8];
+} ds4_block_iq2_xxs;
 
 static __aicore__ inline float ds4_abs_f32(float x) {
     return x < 0.0f ? -x : x;
 }
 
 static __aicore__ inline int32_t ds4_round_f32_to_i32(float x) {
-    return (int32_t)(x >= 0.0f ? x + 0.5f : x - 0.5f);
+    const int32_t i = (int32_t)x;
+    const float frac = x - (float)i;
+    if (frac > 0.5f || (frac == 0.5f && (i & 1) != 0)) return i + 1;
+    if (frac < -0.5f || (frac == -0.5f && (i & 1) != 0)) return i - 1;
+    return i;
 }
 
 static __aicore__ inline float ds4_rsqrt_f32(float x) {
@@ -199,6 +215,80 @@ static __aicore__ inline float ds4_f16_round_f32(float f) {
     return ds4_f16_to_f32(ds4_f32_to_f16(f));
 }
 
+static __aicore__ inline int32_t ds4_dot_q2_16_gm(const __gm__ ds4_block_q2_K *x, const __gm__ ds4_block_q8_K *y, uint32_t block, uint32_t q2_off, uint32_t q8_off, int shift) {
+    int32_t s = 0;
+    for (uint32_t i = 0; i < 16; i++) s += (int32_t)((x[block].qs[q2_off + i] >> shift) & 3u) * (int32_t)y[block].qs[q8_off + i];
+    return s;
+}
+
+static __aicore__ inline float ds4_dot_q2_K_q8_K(uint32_t n, const __gm__ ds4_block_q2_K *x, const __gm__ ds4_block_q8_K *y) {
+    const uint32_t nb = n / DS4_QK_K;
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < nb; i++) {
+        int summs = 0;
+        for (uint32_t j = 0; j < 16; j++) summs += y[i].bsums[j] * (x[i].scales[j] >> 4);
+        const float dall = y[i].d * ds4_f16_to_f32(x[i].d);
+        const float dmin = y[i].d * ds4_f16_to_f32(x[i].dmin);
+        int isum = 0;
+        int is = 0;
+        uint32_t q2_off = 0;
+        uint32_t q8_off = 0;
+        for (uint32_t k = 0; k < DS4_QK_K / 128; k++) {
+            int shift = 0;
+            for (uint32_t j = 0; j < 4; j++) {
+                int d = x[i].scales[is++] & 0x0f;
+                isum += d * ds4_dot_q2_16_gm(x, y, i, q2_off, q8_off, shift);
+                d = x[i].scales[is++] & 0x0f;
+                isum += d * ds4_dot_q2_16_gm(x, y, i, q2_off + 16u, q8_off + 16u, shift);
+                shift += 2;
+                q8_off += 32u;
+            }
+            q2_off += 32u;
+        }
+        sumf += dall * (float)isum - dmin * (float)summs;
+    }
+    return sumf;
+}
+
+static __aicore__ inline float ds4_dot_iq2_xxs_q8_K(uint32_t n, const __gm__ ds4_block_iq2_xxs *x, const __gm__ ds4_block_q8_K *y, const __gm__ uint8_t *ksigns, const __gm__ uint64_t *grid) {
+    const uint32_t nb = n / DS4_QK_K;
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = ds4_f16_to_f32(x[i].d) * y[i].d;
+        int32_t bsum = 0;
+        uint32_t q2_off = 0;
+        uint32_t q8_off = 0;
+        for (uint32_t ib32 = 0; ib32 < DS4_QK_K / 32; ib32++) {
+            const uint32_t aux_g = (uint32_t)x[i].qs[q2_off] | ((uint32_t)x[i].qs[q2_off + 1u] << 16);
+            const uint32_t aux_s = (uint32_t)x[i].qs[q2_off + 2u] | ((uint32_t)x[i].qs[q2_off + 3u] << 16);
+            q2_off += 4u;
+            const uint32_t ls = 2u * (aux_s >> 28) + 1u;
+            int32_t sumi = 0;
+            for (uint32_t l = 0; l < 4; l += 2) {
+                const uint8_t grid0 = (uint8_t)((aux_g >> (8u * l)) & 0xffu);
+                const uint8_t grid1 = (uint8_t)((aux_g >> (8u * (l + 1u))) & 0xffu);
+                const uint32_t sign0 = (aux_s >> (7u * l)) & 127u;
+                const uint32_t sign1 = (aux_s >> (7u * (l + 1u))) & 127u;
+                const uint64_t g0 = grid[grid0];
+                const uint64_t g1 = grid[grid1];
+                const uint8_t s0 = ksigns[sign0];
+                const uint8_t s1 = ksigns[sign1];
+                for (uint32_t j = 0; j < 8; j++) {
+                    int32_t w0 = (int32_t)((g0 >> (8u * j)) & 0xffu);
+                    int32_t w1 = (int32_t)((g1 >> (8u * j)) & 0xffu);
+                    if (s0 & (1u << j)) w0 = -w0;
+                    if (s1 & (1u << j)) w1 = -w1;
+                    sumi += w0 * (int32_t)y[i].qs[q8_off + j] + w1 * (int32_t)y[i].qs[q8_off + 8u + j];
+                }
+                q8_off += 16u;
+            }
+            bsum += sumi * (int32_t)ls;
+        }
+        sumf += d * (float)bsum;
+    }
+    return 0.125f * sumf;
+}
+
 extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_fill_f32(GM_ADDR out_gm, float value, uint32_t count) {
     GlobalTensor<float> out;
     out.SetGlobalBuffer((__gm__ float *)out_gm, count);
@@ -225,6 +315,40 @@ extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_matmul_f16(GM_ADD
             sum += ds4_f16_to_f32(w.GetValue(w_base + c)) * x.GetValue(x_base + c);
         }
         out.SetValue(gid, sum);
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_embed_token_hc(GM_ADDR out_gm, GM_ADDR w_gm, uint32_t token, uint32_t n_embd, uint32_t n_hc, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> out;
+    GlobalTensor<uint16_t> w;
+    out.SetGlobalBuffer((__gm__ float *)out_gm, n_hc * n_embd);
+    w.SetGlobalBuffer((__gm__ uint16_t *)w_gm, (token + 1u) * n_embd);
+
+    const uint32_t total = n_hc * n_embd;
+    const uint32_t base = token * n_embd;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t d = gid % n_embd;
+        out.SetValue(gid, ds4_f16_to_f32(w.GetValue(base + d)));
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_embed_tokens_hc(GM_ADDR out_gm, GM_ADDR tokens_gm, GM_ADDR w_gm, uint32_t n_vocab, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> out;
+    GlobalTensor<int32_t> tokens;
+    GlobalTensor<uint16_t> w;
+    out.SetGlobalBuffer((__gm__ float *)out_gm, n_tokens * n_hc * n_embd);
+    tokens.SetGlobalBuffer((__gm__ int32_t *)tokens_gm, n_tokens);
+    w.SetGlobalBuffer((__gm__ uint16_t *)w_gm, n_vocab * n_embd);
+
+    const uint32_t total = n_tokens * n_hc * n_embd;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t d = gid % n_embd;
+        const uint32_t t = gid / (n_hc * n_embd);
+        int32_t tok = tokens.GetValue(t);
+        if (tok < 0 || tok >= (int32_t)n_vocab) tok = 0;
+        out.SetValue(gid, ds4_f16_to_f32(w.GetValue((uint32_t)tok * n_embd + d)));
     }
 }
 
@@ -353,6 +477,24 @@ extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_hc_weighted_sum4(
     }
 }
 
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_output_hc_weights(GM_ADDR out_gm, GM_ADDR pre_gm, GM_ADDR scale_gm, GM_ADDR base_gm, uint32_t n_hc, uint32_t n_tokens, float eps, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> out;
+    GlobalTensor<float> pre;
+    GlobalTensor<float> scale;
+    GlobalTensor<float> base;
+    out.SetGlobalBuffer((__gm__ float *)out_gm, n_tokens * n_hc);
+    pre.SetGlobalBuffer((__gm__ float *)pre_gm, n_tokens * n_hc);
+    scale.SetGlobalBuffer((__gm__ float *)scale_gm, 1u);
+    base.SetGlobalBuffer((__gm__ float *)base_gm, n_hc);
+    const float s = scale.GetValue(0);
+    const uint32_t total = n_tokens * n_hc;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t h = gid % n_hc;
+        out.SetValue(gid, ds4_sigmoid_f32(pre.GetValue(gid) * s + base.GetValue(h)) + eps);
+    }
+}
+
 extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_router_select(GM_ADDR selected_gm, GM_ADDR weights_gm, GM_ADDR probs_gm, GM_ADDR bias_gm, GM_ADDR hash_gm, GM_ADDR logits_gm, GM_ADDR tokens_gm, int32_t token_scalar, uint32_t hash_rows, uint32_t n_tokens, uint32_t has_bias, uint32_t hash_mode, uint32_t start_row, uint32_t stride) {
     GlobalTensor<int32_t> selected;
     GlobalTensor<float> weights;
@@ -454,6 +596,36 @@ extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_hc_expand_split(G
         const uint32_t comb_base = split_base + 2u * n_hc + dst;
         for (uint32_t src = 0; src < n_hc; src++) {
             acc += split.GetValue(comb_base + src * n_hc) * residual.GetValue(res_base + src * n_embd);
+        }
+        out.SetValue(gid, acc);
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_hc_expand(GM_ADDR out_gm, GM_ADDR block_out_gm, GM_ADDR residual_gm, GM_ADDR post_gm, GM_ADDR comb_gm, uint32_t n_embd, uint32_t n_hc, uint32_t rows, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> out;
+    GlobalTensor<float> block_out;
+    GlobalTensor<float> residual;
+    GlobalTensor<float> post;
+    GlobalTensor<float> comb;
+    out.SetGlobalBuffer((__gm__ float *)out_gm, rows * n_hc * n_embd);
+    block_out.SetGlobalBuffer((__gm__ float *)block_out_gm, rows * n_embd);
+    residual.SetGlobalBuffer((__gm__ float *)residual_gm, rows * n_hc * n_embd);
+    post.SetGlobalBuffer((__gm__ float *)post_gm, rows * n_hc);
+    comb.SetGlobalBuffer((__gm__ float *)comb_gm, rows * n_hc * n_hc);
+
+    const uint32_t total = rows * n_hc * n_embd;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t d = gid % n_embd;
+        const uint32_t tmp = gid / n_embd;
+        const uint32_t dst = tmp % n_hc;
+        const uint32_t r = tmp / n_hc;
+        const uint32_t block_idx = r * n_embd + d;
+        float acc = block_out.GetValue(block_idx) * post.GetValue(r * n_hc + dst);
+        const uint32_t res_base = r * n_hc * n_embd + d;
+        const uint32_t comb_base = r * n_hc * n_hc + dst;
+        for (uint32_t src = 0; src < n_hc; src++) {
+            acc += comb.GetValue(comb_base + src * n_hc) * residual.GetValue(res_base + src * n_embd);
         }
         out.SetValue(gid, acc);
     }
@@ -648,6 +820,122 @@ extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_attention_prefill
     }
 }
 
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_attention_decode(GM_ADDR heads_gm, GM_ADDR sinks_gm, GM_ADDR q_gm, GM_ADDR raw_kv_gm, GM_ADDR comp_kv_gm, GM_ADDR comp_mask_gm, uint32_t use_comp_mask, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t n_head, uint32_t head_dim, float scale, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> heads;
+    GlobalTensor<float> sinks;
+    GlobalTensor<float> q;
+    GlobalTensor<float> raw_kv;
+    GlobalTensor<float> comp_kv;
+    GlobalTensor<float> comp_mask;
+    heads.SetGlobalBuffer((__gm__ float *)heads_gm, n_head * head_dim);
+    sinks.SetGlobalBuffer((__gm__ float *)sinks_gm, n_head);
+    q.SetGlobalBuffer((__gm__ float *)q_gm, n_head * head_dim);
+    raw_kv.SetGlobalBuffer((__gm__ float *)raw_kv_gm, raw_cap * head_dim);
+    comp_kv.SetGlobalBuffer((__gm__ float *)comp_kv_gm, n_comp * head_dim);
+    comp_mask.SetGlobalBuffer((__gm__ float *)comp_mask_gm, n_comp);
+
+    float scores[1024];
+    if (stride == 0) stride = 1;
+    for (uint32_t h = start_gid; h < n_head; h += stride) {
+        const uint32_t q_base = h * head_dim;
+        float max_s = sinks.GetValue(h);
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const uint32_t raw_idx = (raw_start + r) % raw_cap;
+            const uint32_t kv_base = raw_idx * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += q.GetValue(q_base + d) * raw_kv.GetValue(kv_base + d);
+            const float s = dot * scale;
+            scores[r] = s;
+            if (s > max_s) max_s = s;
+        }
+        for (uint32_t c = 0; c < n_comp; c++) {
+            float s = -3.402823466e+38f;
+            const float add = use_comp_mask ? comp_mask.GetValue(c) : 0.0f;
+            if (add > -1.0e20f) {
+                const uint32_t kv_base = c * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += q.GetValue(q_base + d) * comp_kv.GetValue(kv_base + d);
+                s = dot * scale + add;
+            }
+            scores[n_raw + c] = s;
+            if (s > max_s) max_s = s;
+        }
+        float denom = ds4_exp_f32(sinks.GetValue(h) - max_s);
+        for (uint32_t i = 0; i < n_raw + n_comp; i++) {
+            scores[i] = ds4_exp_f32(scores[i] - max_s);
+            denom += scores[i];
+        }
+        const float inv_denom = denom != 0.0f ? 1.0f / denom : 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < n_raw; r++) acc += raw_kv.GetValue(((raw_start + r) % raw_cap) * head_dim + d) * scores[r];
+            for (uint32_t c = 0; c < n_comp; c++) acc += comp_kv.GetValue(c * head_dim + d) * scores[n_raw + c];
+            heads.SetValue(q_base + d, acc * inv_denom);
+        }
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_attention_prefill_mixed(GM_ADDR heads_gm, GM_ADDR sinks_gm, GM_ADDR q_gm, GM_ADDR raw_kv_gm, GM_ADDR comp_kv_gm, GM_ADDR comp_mask_gm, uint32_t use_comp_mask, uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim, float scale, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> heads;
+    GlobalTensor<float> sinks;
+    GlobalTensor<float> q;
+    GlobalTensor<float> raw_kv;
+    GlobalTensor<float> comp_kv;
+    GlobalTensor<float> comp_mask;
+    heads.SetGlobalBuffer((__gm__ float *)heads_gm, n_tokens * n_head * head_dim);
+    sinks.SetGlobalBuffer((__gm__ float *)sinks_gm, n_head);
+    q.SetGlobalBuffer((__gm__ float *)q_gm, n_tokens * n_head * head_dim);
+    raw_kv.SetGlobalBuffer((__gm__ float *)raw_kv_gm, n_tokens * head_dim);
+    comp_kv.SetGlobalBuffer((__gm__ float *)comp_kv_gm, n_comp * head_dim);
+    comp_mask.SetGlobalBuffer((__gm__ float *)comp_mask_gm, n_tokens * n_comp);
+
+    float scores[1024];
+    const uint32_t total = n_tokens * n_head;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t h = gid % n_head;
+        const uint32_t t = gid / n_head;
+        const uint32_t raw_start = (window != 0 && t + 1u > window) ? t + 1u - window : 0u;
+        const uint32_t raw_count = t + 1u - raw_start;
+        uint32_t visible_comp = n_comp != 0 ? (t + 1u) / ratio : 0u;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+        const uint32_t q_base = (t * n_head + h) * head_dim;
+        float max_s = sinks.GetValue(h);
+        for (uint32_t r = 0; r < raw_count; r++) {
+            const uint32_t kv_base = (raw_start + r) * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += q.GetValue(q_base + d) * raw_kv.GetValue(kv_base + d);
+            const float s = dot * scale;
+            scores[r] = s;
+            if (s > max_s) max_s = s;
+        }
+        for (uint32_t c = 0; c < visible_comp; c++) {
+            float s = -3.402823466e+38f;
+            const float add = use_comp_mask ? comp_mask.GetValue(t * n_comp + c) : 0.0f;
+            if (add > -1.0e20f) {
+                const uint32_t kv_base = c * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += q.GetValue(q_base + d) * comp_kv.GetValue(kv_base + d);
+                s = dot * scale + add;
+            }
+            scores[raw_count + c] = s;
+            if (s > max_s) max_s = s;
+        }
+        float denom = ds4_exp_f32(sinks.GetValue(h) - max_s);
+        for (uint32_t r = 0; r < raw_count + visible_comp; r++) {
+            scores[r] = ds4_exp_f32(scores[r] - max_s);
+            denom += scores[r];
+        }
+        const float inv_denom = denom != 0.0f ? 1.0f / denom : 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv.GetValue((raw_start + r) * head_dim + d) * scores[r];
+            for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv.GetValue(c * head_dim + d) * scores[raw_count + c];
+            heads.SetValue(q_base + d, acc * inv_denom);
+        }
+    }
+}
+
 extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_attention_output_low_q8(GM_ADDR low_gm, GM_ADDR w_gm, GM_ADDR heads_gm, uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens, uint32_t start_gid, uint32_t stride) {
     GlobalTensor<float> low;
     GlobalTensor<float> heads;
@@ -738,18 +1026,417 @@ extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_quantize_q8_k(GM_
     }
 }
 
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_moe_gate_up_mid_iq2_q8(GM_ADDR gate_out_gm, GM_ADDR up_out_gm, GM_ADDR mid_out_gm, GM_ADDR gate_w_gm, GM_ADDR up_w_gm, GM_ADDR xq_gm, GM_ADDR selected_gm, GM_ADDR weights_gm, GM_ADDR ksigns_gm, GM_ADDR grid_gm, uint32_t pair_count, uint32_t n_expert, uint32_t expert_begin, uint32_t expert_count, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t gate_expert_blocks, uint32_t gate_row_blocks, float clamp, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> gate_out;
+    GlobalTensor<float> up_out;
+    GlobalTensor<float> mid_out;
+    GlobalTensor<int32_t> selected;
+    GlobalTensor<float> weights;
+    gate_out.SetGlobalBuffer((__gm__ float *)gate_out_gm, pair_count * expert_mid_dim);
+    up_out.SetGlobalBuffer((__gm__ float *)up_out_gm, pair_count * expert_mid_dim);
+    mid_out.SetGlobalBuffer((__gm__ float *)mid_out_gm, pair_count * expert_mid_dim);
+    selected.SetGlobalBuffer((__gm__ int32_t *)selected_gm, pair_count);
+    weights.SetGlobalBuffer((__gm__ float *)weights_gm, pair_count);
+    const __gm__ ds4_block_iq2_xxs *gate_w = (const __gm__ ds4_block_iq2_xxs *)gate_w_gm;
+    const __gm__ ds4_block_iq2_xxs *up_w = (const __gm__ ds4_block_iq2_xxs *)up_w_gm;
+    const __gm__ ds4_block_q8_K *xq = (const __gm__ ds4_block_q8_K *)xq_gm;
+    const __gm__ uint8_t *ksigns = (const __gm__ uint8_t *)ksigns_gm;
+    const __gm__ uint64_t *grid = (const __gm__ uint64_t *)grid_gm;
+    const uint32_t in_blocks = expert_in_dim / DS4_QK_K;
+    const uint32_t total = pair_count * expert_mid_dim;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t pair = gid / expert_mid_dim;
+        const uint32_t row = gid - pair * expert_mid_dim;
+        int32_t expert_i = selected.GetValue(pair);
+        if (expert_i < 0) expert_i = 0;
+        if (expert_i < (int32_t)expert_begin || expert_i >= (int32_t)(expert_begin + expert_count)) continue;
+        const uint32_t expert = (uint32_t)expert_i - expert_begin;
+        const uint32_t tok = pair / n_expert;
+        const __gm__ ds4_block_q8_K *xq_row = xq + tok * in_blocks;
+        const __gm__ ds4_block_iq2_xxs *gr = gate_w + expert * gate_expert_blocks + row * gate_row_blocks;
+        const __gm__ ds4_block_iq2_xxs *ur = up_w + expert * gate_expert_blocks + row * gate_row_blocks;
+        float gv = ds4_dot_iq2_xxs_q8_K(expert_in_dim, gr, xq_row, ksigns, grid);
+        float uv = ds4_dot_iq2_xxs_q8_K(expert_in_dim, ur, xq_row, ksigns, grid);
+        if (clamp > 1.0e-6f) {
+            if (gv > clamp) gv = clamp;
+            if (uv > clamp) uv = clamp;
+            if (uv < -clamp) uv = -clamp;
+        }
+        const float mid = gv * ds4_sigmoid_f32(gv) * uv * weights.GetValue(pair);
+        gate_out.SetValue(gid, gv);
+        up_out.SetValue(gid, uv);
+        mid_out.SetValue(gid, mid);
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_moe_down_q2_q8(GM_ADDR experts_out_gm, GM_ADDR down_w_gm, GM_ADDR midq_gm, GM_ADDR selected_gm, uint32_t pair_count, uint32_t expert_begin, uint32_t expert_count, uint32_t expert_mid_dim, uint32_t out_dim, uint32_t down_expert_blocks, uint32_t down_row_blocks, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> experts_out;
+    GlobalTensor<int32_t> selected;
+    experts_out.SetGlobalBuffer((__gm__ float *)experts_out_gm, pair_count * out_dim);
+    selected.SetGlobalBuffer((__gm__ int32_t *)selected_gm, pair_count);
+    const __gm__ ds4_block_q2_K *down_w = (const __gm__ ds4_block_q2_K *)down_w_gm;
+    const __gm__ ds4_block_q8_K *midq = (const __gm__ ds4_block_q8_K *)midq_gm;
+    const uint32_t mid_blocks = expert_mid_dim / DS4_QK_K;
+    const uint32_t total = pair_count * out_dim;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t pair = gid / out_dim;
+        const uint32_t row = gid - pair * out_dim;
+        int32_t expert_i = selected.GetValue(pair);
+        if (expert_i < 0) expert_i = 0;
+        if (expert_i < (int32_t)expert_begin || expert_i >= (int32_t)(expert_begin + expert_count)) continue;
+        const uint32_t expert = (uint32_t)expert_i - expert_begin;
+        const __gm__ ds4_block_q8_K *midq_row = midq + pair * mid_blocks;
+        const __gm__ ds4_block_q2_K *dr = down_w + expert * down_expert_blocks + row * down_row_blocks;
+        experts_out.SetValue(gid, ds4_dot_q2_K_q8_K(expert_mid_dim, dr, midq_row));
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_moe_merge_width(GM_ADDR dst_gm, GM_ADDR src_gm, GM_ADDR selected_gm, uint32_t pair_count, uint32_t width, uint32_t expert_begin, uint32_t expert_count, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> dst;
+    GlobalTensor<float> src;
+    GlobalTensor<int32_t> selected;
+    dst.SetGlobalBuffer((__gm__ float *)dst_gm, pair_count * width);
+    src.SetGlobalBuffer((__gm__ float *)src_gm, pair_count * width);
+    selected.SetGlobalBuffer((__gm__ int32_t *)selected_gm, pair_count);
+    const uint32_t total = pair_count * width;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t pair = gid / width;
+        int32_t expert_i = selected.GetValue(pair);
+        if (expert_i < 0) expert_i = 0;
+        if (expert_i < (int32_t)expert_begin || expert_i >= (int32_t)(expert_begin + expert_count)) continue;
+        dst.SetValue(gid, src.GetValue(gid));
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_moe_sum_experts(GM_ADDR out_gm, GM_ADDR experts_gm, uint32_t n_tokens, uint32_t n_expert, uint32_t out_dim, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> out;
+    GlobalTensor<float> experts;
+    out.SetGlobalBuffer((__gm__ float *)out_gm, n_tokens * out_dim);
+    experts.SetGlobalBuffer((__gm__ float *)experts_gm, n_tokens * n_expert * out_dim);
+    const uint32_t total = n_tokens * out_dim;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t tok = gid / out_dim;
+        const uint32_t row = gid - tok * out_dim;
+        float acc = 0.0f;
+        for (uint32_t slot = 0; slot < n_expert; slot++) {
+            const uint32_t off = (tok * n_expert + slot) * out_dim + row;
+            acc += experts.GetValue(off);
+        }
+        out.SetValue(gid, acc);
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_swiglu(GM_ADDR out_gm, GM_ADDR gate_gm, GM_ADDR up_gm, uint32_t n, float clamp, float weight, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> out;
+    GlobalTensor<float> gate;
+    GlobalTensor<float> up;
+    out.SetGlobalBuffer((__gm__ float *)out_gm, n);
+    gate.SetGlobalBuffer((__gm__ float *)gate_gm, n);
+    up.SetGlobalBuffer((__gm__ float *)up_gm, n);
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < n; gid += stride) {
+        float g = gate.GetValue(gid);
+        float u = up.GetValue(gid);
+        if (clamp > 1.0e-6f) {
+            if (g > clamp) g = clamp;
+            if (u > clamp) u = clamp;
+            if (u < -clamp) u = -clamp;
+        }
+        out.SetValue(gid, g * ds4_sigmoid_f32(g) * u * weight);
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_compressor_set_rows(GM_ADDR state_kv_gm, GM_ADDR state_score_gm, GM_ADDR kv_gm, GM_ADDR sc_gm, GM_ADDR ape_gm, uint32_t ape_type, uint32_t width, uint32_t ratio, uint32_t pos0, uint32_t src0, uint32_t dst0, uint32_t rows, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> state_kv;
+    GlobalTensor<float> state_score;
+    GlobalTensor<float> kv;
+    GlobalTensor<float> sc;
+    GlobalTensor<float> ape_f32;
+    GlobalTensor<uint16_t> ape_f16;
+    state_kv.SetGlobalBuffer((__gm__ float *)state_kv_gm, rows * width);
+    state_score.SetGlobalBuffer((__gm__ float *)state_score_gm, rows * width);
+    kv.SetGlobalBuffer((__gm__ float *)kv_gm, (src0 + rows) * width);
+    sc.SetGlobalBuffer((__gm__ float *)sc_gm, (src0 + rows) * width);
+    ape_f32.SetGlobalBuffer((__gm__ float *)ape_gm, ratio * width);
+    ape_f16.SetGlobalBuffer((__gm__ uint16_t *)ape_gm, ratio * width);
+    const uint32_t total = rows * width;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t r = gid / width;
+        const uint32_t j = gid - r * width;
+        const uint32_t src = src0 + r;
+        const uint32_t dst = dst0 + r;
+        const uint32_t phase = (pos0 + src) % ratio;
+        const uint32_t src_idx = src * width + j;
+        const uint32_t dst_idx = dst * width + j;
+        const uint32_t ape_idx = phase * width + j;
+        const float ape = ape_type == 1u ? ds4_f16_to_f32(ape_f16.GetValue(ape_idx)) : ape_f32.GetValue(ape_idx);
+        state_kv.SetValue(dst_idx, kv.GetValue(src_idx));
+        state_score.SetValue(dst_idx, sc.GetValue(src_idx) + ape);
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_compressor_prefill_pool(GM_ADDR comp_gm, GM_ADDR kv_gm, GM_ADDR sc_gm, GM_ADDR state_kv_gm, GM_ADDR state_score_gm, GM_ADDR ape_gm, uint32_t ape_type, uint32_t head_dim, uint32_t ratio, uint32_t pos0, uint32_t n_comp, uint32_t replay, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> comp;
+    GlobalTensor<float> kv;
+    GlobalTensor<float> sc;
+    GlobalTensor<float> state_kv;
+    GlobalTensor<float> state_score;
+    GlobalTensor<float> ape_f32;
+    GlobalTensor<uint16_t> ape_f16;
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t width = coff * head_dim;
+    comp.SetGlobalBuffer((__gm__ float *)comp_gm, n_comp * head_dim);
+    kv.SetGlobalBuffer((__gm__ float *)kv_gm, n_comp * ratio * width);
+    sc.SetGlobalBuffer((__gm__ float *)sc_gm, n_comp * ratio * width);
+    state_kv.SetGlobalBuffer((__gm__ float *)state_kv_gm, coff * ratio * width);
+    state_score.SetGlobalBuffer((__gm__ float *)state_score_gm, coff * ratio * width);
+    ape_f32.SetGlobalBuffer((__gm__ float *)ape_gm, ratio * width);
+    ape_f16.SetGlobalBuffer((__gm__ uint16_t *)ape_gm, ratio * width);
+    const uint32_t total = n_comp * head_dim;
+    if (stride == 0) stride = 1;
+    for (uint32_t gid = start_gid; gid < total; gid += stride) {
+        const uint32_t c = gid / head_dim;
+        const uint32_t d = gid - c * head_dim;
+        float vals[128];
+        float scores[128];
+        float max_s = -3.402823466e+38f;
+        uint32_t n_cand = 0;
+        if (ratio == 4u) {
+            if (replay && c == 0) {
+                for (uint32_t r = 0; r < 4u; r++) {
+                    vals[n_cand] = state_kv.GetValue(r * width + d);
+                    scores[n_cand] = state_score.GetValue(r * width + d);
+                    if (scores[n_cand] > max_s) max_s = scores[n_cand];
+                    n_cand++;
+                }
+            } else if (c > 0) {
+                const uint32_t base = (c - 1u) * ratio;
+                for (uint32_t r = 0; r < 4u; r++) {
+                    const uint32_t t = base + r;
+                    const uint32_t phase = (pos0 + t) % ratio;
+                    const uint32_t ape_idx = phase * width + d;
+                    const float ape = ape_type == 1u ? ds4_f16_to_f32(ape_f16.GetValue(ape_idx)) : ape_f32.GetValue(ape_idx);
+                    vals[n_cand] = kv.GetValue(t * width + d);
+                    scores[n_cand] = sc.GetValue(t * width + d) + ape;
+                    if (scores[n_cand] > max_s) max_s = scores[n_cand];
+                    n_cand++;
+                }
+            }
+            const uint32_t base = c * ratio;
+            for (uint32_t r = 0; r < 4u; r++) {
+                const uint32_t t = base + r;
+                const uint32_t phase = (pos0 + t) % ratio;
+                const uint32_t ape_idx = phase * width + head_dim + d;
+                const float ape = ape_type == 1u ? ds4_f16_to_f32(ape_f16.GetValue(ape_idx)) : ape_f32.GetValue(ape_idx);
+                vals[n_cand] = kv.GetValue(t * width + head_dim + d);
+                scores[n_cand] = sc.GetValue(t * width + head_dim + d) + ape;
+                if (scores[n_cand] > max_s) max_s = scores[n_cand];
+                n_cand++;
+            }
+        } else {
+            const uint32_t base = c * ratio;
+            for (uint32_t r = 0; r < ratio; r++) {
+                const uint32_t t = base + r;
+                const uint32_t phase = (pos0 + t) % ratio;
+                const uint32_t ape_idx = phase * width + d;
+                const float ape = ape_type == 1u ? ds4_f16_to_f32(ape_f16.GetValue(ape_idx)) : ape_f32.GetValue(ape_idx);
+                vals[n_cand] = kv.GetValue(t * width + d);
+                scores[n_cand] = sc.GetValue(t * width + d) + ape;
+                if (scores[n_cand] > max_s) max_s = scores[n_cand];
+                n_cand++;
+            }
+        }
+        float den = 0.0f;
+        float acc = 0.0f;
+        for (uint32_t i = 0; i < n_cand; i++) {
+            const float w = ds4_exp_f32(scores[i] - max_s);
+            den += w;
+            acc += vals[i] * w;
+        }
+        comp.SetValue(c * head_dim + d, den != 0.0f ? acc / den : 0.0f);
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_add_f32(GM_ADDR out_gm, GM_ADDR a_gm, GM_ADDR b_gm, uint32_t count, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> out;
+    GlobalTensor<float> a;
+    GlobalTensor<float> b;
+    out.SetGlobalBuffer((__gm__ float *)out_gm, count);
+    a.SetGlobalBuffer((__gm__ float *)a_gm, count);
+    b.SetGlobalBuffer((__gm__ float *)b_gm, count);
+    if (stride == 0) stride = 1;
+    for (uint32_t i = start_gid; i < count; i += stride) out.SetValue(i, a.GetValue(i) + b.GetValue(i));
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_compressor_update_pool(GM_ADDR row_gm, GM_ADDR state_kv_gm, GM_ADDR state_score_gm, uint32_t head_dim, uint32_t ratio, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> row;
+    GlobalTensor<float> state_kv;
+    GlobalTensor<float> state_score;
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t width = coff * head_dim;
+    row.SetGlobalBuffer((__gm__ float *)row_gm, head_dim);
+    state_kv.SetGlobalBuffer((__gm__ float *)state_kv_gm, coff * ratio * width);
+    state_score.SetGlobalBuffer((__gm__ float *)state_score_gm, coff * ratio * width);
+    if (stride == 0) stride = 1;
+    for (uint32_t d = start_gid; d < head_dim; d += stride) {
+        float vals[128];
+        float scores[128];
+        float max_s = -3.402823466e+38f;
+        uint32_t n_cand = 0;
+        if (ratio == 4u) {
+            for (uint32_t r = 0; r < 4u; r++) {
+                vals[n_cand] = state_kv.GetValue(r * width + d);
+                scores[n_cand] = state_score.GetValue(r * width + d);
+                if (scores[n_cand] > max_s) max_s = scores[n_cand];
+                n_cand++;
+            }
+            for (uint32_t r = 0; r < 4u; r++) {
+                vals[n_cand] = state_kv.GetValue((ratio + r) * width + head_dim + d);
+                scores[n_cand] = state_score.GetValue((ratio + r) * width + head_dim + d);
+                if (scores[n_cand] > max_s) max_s = scores[n_cand];
+                n_cand++;
+            }
+        } else {
+            for (uint32_t r = 0; r < ratio; r++) {
+                vals[n_cand] = state_kv.GetValue(r * width + d);
+                scores[n_cand] = state_score.GetValue(r * width + d);
+                if (scores[n_cand] > max_s) max_s = scores[n_cand];
+                n_cand++;
+            }
+        }
+        float den = 0.0f;
+        float acc = 0.0f;
+        for (uint32_t i = 0; i < n_cand; i++) {
+            const float w = ds4_exp_f32(scores[i] - max_s);
+            den += w;
+            acc += vals[i] * w;
+        }
+        row.SetValue(d, den != 0.0f ? acc / den : 0.0f);
+    }
+}
+
+extern "C" __global__ __aicore__ __attribute__((aiv)) void ds4_compressor_shift_ratio4(GM_ADDR state_kv_gm, GM_ADDR state_score_gm, uint32_t width, uint32_t start_gid, uint32_t stride) {
+    GlobalTensor<float> state_kv;
+    GlobalTensor<float> state_score;
+    state_kv.SetGlobalBuffer((__gm__ float *)state_kv_gm, 8u * width);
+    state_score.SetGlobalBuffer((__gm__ float *)state_score_gm, 8u * width);
+    const uint32_t half = 4u * width;
+    if (stride == 0) stride = 1;
+    for (uint32_t i = start_gid; i < half; i += stride) {
+        const float v = state_kv.GetValue(half + i);
+        const float s = state_score.GetValue(half + i);
+        state_kv.SetValue(i, v);
+        state_score.SetValue(i, s);
+        state_kv.SetValue(half + i, v);
+        state_score.SetValue(half + i, s);
+    }
+}
+
 extern "C" void ds4_ascend_launch_fill_f32(void *stream, void *out, float value, uint32_t count) {
     ds4_fill_f32<<<1, nullptr, stream>>>((GM_ADDR)out, value, count);
+}
+
+extern "C" void ds4_ascend_launch_add_f32(void *stream, void *out, const void *a, const void *b, uint32_t count) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_add_f32<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)a, (GM_ADDR)b, count, p, parts);
+    }
 }
 
 extern "C" void ds4_ascend_launch_quantize_q8_k(void *stream, void *out, const void *x, uint32_t rows, uint32_t cols) {
     ds4_quantize_q8_k<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)x, rows, cols);
 }
 
+extern "C" void ds4_ascend_launch_moe_gate_up_mid_iq2_q8(void *stream, void *gate_out, void *up_out, void *mid_out, const void *gate_w, const void *up_w, const void *xq, const void *selected, const void *weights, const void *ksigns, const void *grid, uint32_t pair_count, uint32_t n_expert, uint32_t expert_begin, uint32_t expert_count, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, float clamp) {
+    const uint32_t parts = 8u;
+    const uint32_t gate_expert_blocks = (uint32_t)(gate_expert_bytes / sizeof(ds4_block_iq2_xxs));
+    const uint32_t gate_row_blocks = (uint32_t)(gate_row_bytes / sizeof(ds4_block_iq2_xxs));
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_moe_gate_up_mid_iq2_q8<<<1, nullptr, stream>>>((GM_ADDR)gate_out, (GM_ADDR)up_out, (GM_ADDR)mid_out, (GM_ADDR)gate_w, (GM_ADDR)up_w, (GM_ADDR)xq, (GM_ADDR)selected, (GM_ADDR)weights, (GM_ADDR)ksigns, (GM_ADDR)grid, pair_count, n_expert, expert_begin, expert_count, expert_in_dim, expert_mid_dim, gate_expert_blocks, gate_row_blocks, clamp, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_moe_down_q2_q8(void *stream, void *experts_out, const void *down_w, const void *midq, const void *selected, uint32_t pair_count, uint32_t expert_begin, uint32_t expert_count, uint32_t expert_mid_dim, uint32_t out_dim, uint64_t down_expert_bytes, uint64_t down_row_bytes) {
+    const uint32_t parts = 8u;
+    const uint32_t down_expert_blocks = (uint32_t)(down_expert_bytes / sizeof(ds4_block_q2_K));
+    const uint32_t down_row_blocks = (uint32_t)(down_row_bytes / sizeof(ds4_block_q2_K));
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_moe_down_q2_q8<<<1, nullptr, stream>>>((GM_ADDR)experts_out, (GM_ADDR)down_w, (GM_ADDR)midq, (GM_ADDR)selected, pair_count, expert_begin, expert_count, expert_mid_dim, out_dim, down_expert_blocks, down_row_blocks, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_moe_merge_width(void *stream, void *dst, const void *src, const void *selected, uint32_t pair_count, uint32_t width, uint32_t expert_begin, uint32_t expert_count) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_moe_merge_width<<<1, nullptr, stream>>>((GM_ADDR)dst, (GM_ADDR)src, (GM_ADDR)selected, pair_count, width, expert_begin, expert_count, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_moe_sum_experts(void *stream, void *out, const void *experts, uint32_t n_tokens, uint32_t n_expert, uint32_t out_dim) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_moe_sum_experts<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)experts, n_tokens, n_expert, out_dim, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_swiglu(void *stream, void *out, const void *gate, const void *up, uint32_t n, float clamp, float weight) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_swiglu<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)gate, (GM_ADDR)up, n, clamp, weight, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_compressor_set_rows(void *stream, void *state_kv, void *state_score, const void *kv, const void *sc, const void *ape, uint32_t ape_type, uint32_t width, uint32_t ratio, uint32_t pos0, uint32_t src0, uint32_t dst0, uint32_t rows) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_compressor_set_rows<<<1, nullptr, stream>>>((GM_ADDR)state_kv, (GM_ADDR)state_score, (GM_ADDR)kv, (GM_ADDR)sc, (GM_ADDR)ape, ape_type, width, ratio, pos0, src0, dst0, rows, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_compressor_prefill_pool(void *stream, void *comp, const void *kv, const void *sc, const void *state_kv, const void *state_score, const void *ape, uint32_t ape_type, uint32_t head_dim, uint32_t ratio, uint32_t pos0, uint32_t n_comp, uint32_t replay) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_compressor_prefill_pool<<<1, nullptr, stream>>>((GM_ADDR)comp, (GM_ADDR)kv, (GM_ADDR)sc, (GM_ADDR)state_kv, (GM_ADDR)state_score, (GM_ADDR)ape, ape_type, head_dim, ratio, pos0, n_comp, replay, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_compressor_update_pool(void *stream, void *row, const void *state_kv, const void *state_score, uint32_t head_dim, uint32_t ratio) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_compressor_update_pool<<<1, nullptr, stream>>>((GM_ADDR)row, (GM_ADDR)state_kv, (GM_ADDR)state_score, head_dim, ratio, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_compressor_shift_ratio4(void *stream, void *state_kv, void *state_score, uint32_t width) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_compressor_shift_ratio4<<<1, nullptr, stream>>>((GM_ADDR)state_kv, (GM_ADDR)state_score, width, p, parts);
+    }
+}
+
 extern "C" void ds4_ascend_launch_matmul_f16(void *stream, void *out, const void *w, const void *x, uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
     const uint32_t parts = 8u;
     for (uint32_t p = 0; p < parts; p++) {
         ds4_matmul_f16<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)w, (GM_ADDR)x, in_dim, out_dim, n_tok, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_embed_token_hc(void *stream, void *out, const void *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_embed_token_hc<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)w, token, n_embd, n_hc, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_embed_tokens_hc(void *stream, void *out, const void *tokens, const void *w, uint32_t n_vocab, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_embed_tokens_hc<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)tokens, (GM_ADDR)w, n_vocab, n_tokens, n_embd, n_hc, p, parts);
     }
 }
 
@@ -798,6 +1485,13 @@ extern "C" void ds4_ascend_launch_hc_expand_split(void *stream, void *out, const
     }
 }
 
+extern "C" void ds4_ascend_launch_hc_expand(void *stream, void *out, const void *block_out, const void *residual, const void *post, const void *comb, uint32_t n_embd, uint32_t n_hc, uint32_t rows) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_hc_expand<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)block_out, (GM_ADDR)residual, (GM_ADDR)post, (GM_ADDR)comb, n_embd, n_hc, rows, p, parts);
+    }
+}
+
 extern "C" void ds4_ascend_launch_hc_split_sinkhorn4(void *stream, void *out, const void *mix, const void *scale, const void *base, uint32_t rows, uint32_t sinkhorn_iters, float eps) {
     const uint32_t parts = 8u;
     for (uint32_t p = 0; p < parts; p++) {
@@ -809,6 +1503,13 @@ extern "C" void ds4_ascend_launch_hc_weighted_sum4(void *stream, void *out, cons
     const uint32_t parts = 8u;
     for (uint32_t p = 0; p < parts; p++) {
         ds4_hc_weighted_sum4<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)residual, (GM_ADDR)weights, n_embd, rows, weight_stride, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_output_hc_weights(void *stream, void *out, const void *pre, const void *scale, const void *base, uint32_t n_hc, uint32_t n_tokens, float eps) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_output_hc_weights<<<1, nullptr, stream>>>((GM_ADDR)out, (GM_ADDR)pre, (GM_ADDR)scale, (GM_ADDR)base, n_hc, n_tokens, eps, p, parts);
     }
 }
 
@@ -837,6 +1538,20 @@ extern "C" void ds4_ascend_launch_attention_prefill_raw(void *stream, void *head
     const uint32_t parts = 8u;
     for (uint32_t p = 0; p < parts; p++) {
         ds4_attention_prefill_raw<<<1, nullptr, stream>>>((GM_ADDR)heads, (GM_ADDR)sinks, (GM_ADDR)q, (GM_ADDR)raw_kv, n_tokens, window, n_head, head_dim, scale, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_attention_decode(void *stream, void *heads, const void *sinks, const void *q, const void *raw_kv, const void *comp_kv, const void *comp_mask, uint32_t use_comp_mask, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t n_head, uint32_t head_dim, float scale) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_attention_decode<<<1, nullptr, stream>>>((GM_ADDR)heads, (GM_ADDR)sinks, (GM_ADDR)q, (GM_ADDR)raw_kv, (GM_ADDR)comp_kv, (GM_ADDR)comp_mask, use_comp_mask, n_raw, raw_cap, raw_start, n_comp, n_head, head_dim, scale, p, parts);
+    }
+}
+
+extern "C" void ds4_ascend_launch_attention_prefill_mixed(void *stream, void *heads, const void *sinks, const void *q, const void *raw_kv, const void *comp_kv, const void *comp_mask, uint32_t use_comp_mask, uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim, float scale) {
+    const uint32_t parts = 8u;
+    for (uint32_t p = 0; p < parts; p++) {
+        ds4_attention_prefill_mixed<<<1, nullptr, stream>>>((GM_ADDR)heads, (GM_ADDR)sinks, (GM_ADDR)q, (GM_ADDR)raw_kv, (GM_ADDR)comp_kv, (GM_ADDR)comp_mask, use_comp_mask, n_tokens, n_comp, window, ratio, n_head, head_dim, scale, p, parts);
     }
 }
 

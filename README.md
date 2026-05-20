@@ -12,6 +12,7 @@ speed testing.
 We support the following backends:
 * **Metal** is our primary target. Starting from MacBooks with 96GB of RAM.
 * **NVIDIA CUDA** with special care for the DGX Spark.
+* **Ascend** is experimental and currently targets Atlas 300I Duo / Ascend 310P3 with the q2-imatrix DeepSeek V4 Flash GGUF; see [ASCEND.md](ASCEND.md).
 * **AMD ROCm** is only supported in the [rocm](https://github.com/antirez/ds4/tree/rocm) branch. It is kept separate from main since I (antirez) don't have direct hardware access, so the community rebases the branch as needed.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
@@ -71,6 +72,8 @@ next sections.
 
 - [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
   guide for contributors. **Read this before sending a pull request**.
+- [ASCEND.md](ASCEND.md): Atlas 300I Duo / Ascend 310P3 backend notes,
+  no-host validation status, and current optimization direction.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
   imatrix collection, quantization tooling, and quality checks.
 - [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
@@ -163,6 +166,19 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
 | DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
+
+The Ascend backend is currently a bring-up backend, not a speed target yet. On
+Atlas 300I Duo / Ascend 310P3 it can run the q2-imatrix model with
+`DS4_ASCEND_NO_HOST_FALLBACK=1`, graph diagnostics pass the current layer-0 smoke
+baseline, and a short greedy `Hello -n8` smoke has produced readable text. Current
+performance is dominated by startup and correctness-first prefill kernels: expert
+sharding prepares about 72.56 GiB of q2 tensors in roughly 135-146 seconds, and
+profiled prefill layers show about 97-105 seconds in attention plus about 23
+seconds in FFN per layer. This path still needs optimization before its
+throughput numbers are comparable with Metal or CUDA. The immediate plan is to
+finish longer no-host correctness smoke tests first, then optimize startup
+sharding, prefill attention, FFN/MoE orchestration, temporary-buffer reuse, and
+kernel launch count.
 
 ![M3 Max t/s](speed-bench/m3_max_ts.svg)
 

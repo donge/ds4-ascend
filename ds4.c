@@ -8105,6 +8105,14 @@ typedef struct {
     ds4_gpu_tensor *q;
     ds4_gpu_tensor *kv_raw;
     ds4_gpu_tensor *kv;
+    ds4_gpu_tensor *debug_attn_post;
+    ds4_gpu_tensor *debug_attn_comb;
+    ds4_gpu_tensor *debug_qr;
+    ds4_gpu_tensor *debug_qr_norm;
+    ds4_gpu_tensor *debug_q_raw;
+    ds4_gpu_tensor *debug_q_norm;
+    ds4_gpu_tensor *debug_kv_raw;
+    ds4_gpu_tensor *debug_kv_norm;
 
     /* Persistent KV state.  Raw KV is a sliding-window ring per layer.  Ratio-4
      * layers also keep an indexer-compressed cache; ratio-128 layers keep only
@@ -8604,6 +8612,27 @@ static void metal_graph_debug_dump_i32_tensor(
     if (ds4_gpu_begin_commands() == 0) {
         fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
     }
+}
+
+static bool metal_graph_debug_snapshot_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint64_t              bytes,
+        const char           *name,
+        uint32_t              il,
+        uint32_t              pos) {
+    if (!dst) return true;
+    if (!src || bytes == 0) return false;
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before snapshotting %s layer %u pos %u\n", name, il, pos);
+        return false;
+    }
+    const bool ok = ds4_gpu_tensor_copy(dst, 0, src, 0, bytes) != 0;
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after snapshotting %s layer %u pos %u\n", name, il, pos);
+        return false;
+    }
+    return ok;
 }
 
 static bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint32_t pos) {
@@ -9235,6 +9264,8 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("hc_attn_pre_weights", g->hc_pre, DS4_N_HC, il, pos);
         metal_graph_debug_dump_tensor("hc_attn_pre_post_weights", g->hc_post, DS4_N_HC, il, pos);
         metal_graph_debug_dump_tensor("hc_attn_pre_comb", g->hc_comb, (uint64_t)DS4_N_HC * DS4_N_HC, il, pos);
+        if (g->debug_attn_post) ok = metal_graph_debug_snapshot_tensor(g->debug_attn_post, g->hc_post, (uint64_t)DS4_N_HC * sizeof(float), "hc_attn_pre_post_weights", il, pos);
+        if (ok && g->debug_attn_comb) ok = metal_graph_debug_snapshot_tensor(g->debug_attn_comb, g->hc_comb, (uint64_t)DS4_N_HC * DS4_N_HC * sizeof(float), "hc_attn_pre_comb", il, pos);
     }
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_pre", g->attn_cur, DS4_N_EMBD, il, pos);
@@ -9253,6 +9284,7 @@ static bool metal_graph_encode_decode_layer(
                                               g->attn_norm, 1) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
+        if (g->debug_qr) ok = metal_graph_debug_snapshot_tensor(g->debug_qr, g->qr, q_rank * sizeof(float), "q_lora", il, pos);
     }
     if (qkv_rms_fused) {
         if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
@@ -9261,6 +9293,7 @@ static bool metal_graph_encode_decode_layer(
                                                   g->attn_norm, 1) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
+            if (g->debug_kv_raw) ok = metal_graph_debug_snapshot_tensor(g->debug_kv_raw, g->kv_raw, (uint64_t)DS4_N_HEAD_DIM * sizeof(float), "KVraw", il, pos);
         }
         if (ok) ok = ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(g->qr_norm,
                                                              g->qr,
@@ -9282,9 +9315,11 @@ static bool metal_graph_encode_decode_layer(
     }
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora_norm", g->qr_norm, q_rank, il, pos);
+        if (g->debug_qr_norm) ok = metal_graph_debug_snapshot_tensor(g->debug_qr_norm, g->qr_norm, q_rank * sizeof(float), "q_lora_norm", il, pos);
     }
     if (qkv_rms_fused && ok) {
         metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
+        if (g->debug_kv_norm) ok = metal_graph_debug_snapshot_tensor(g->debug_kv_norm, g->kv, (uint64_t)DS4_N_HEAD_DIM * sizeof(float), "KVnorm", il, pos);
     }
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size,
                                               layer->attn_q_b->abs_offset,
@@ -9292,10 +9327,12 @@ static bool metal_graph_encode_decode_layer(
                                               g->qr_norm, 1) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
+        if (g->debug_q_raw) ok = metal_graph_debug_snapshot_tensor(g->debug_q_raw, g->q, q_dim * sizeof(float), "Qraw", il, pos);
     }
     if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
+        if (g->debug_q_norm) ok = metal_graph_debug_snapshot_tensor(g->debug_q_norm, g->q, q_dim * sizeof(float), "Qnorm", il, pos);
     }
     if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
                                             DS4_N_ROT, pos,
@@ -9313,6 +9350,7 @@ static bool metal_graph_encode_decode_layer(
                                                   g->attn_norm, 1) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
+            if (g->debug_kv_raw) ok = metal_graph_debug_snapshot_tensor(g->debug_kv_raw, g->kv_raw, (uint64_t)DS4_N_HEAD_DIM * sizeof(float), "KVraw", il, pos);
         }
         if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->kv, g->kv_raw,
                                                       model->map, model->size,
@@ -9320,6 +9358,7 @@ static bool metal_graph_encode_decode_layer(
                                                       DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
+            if (g->debug_kv_norm) ok = metal_graph_debug_snapshot_tensor(g->debug_kv_norm, g->kv, (uint64_t)DS4_N_HEAD_DIM * sizeof(float), "KVnorm", il, pos);
         }
     }
     if (ok) ok = ds4_gpu_rope_tail_tensor(g->kv, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
@@ -10367,8 +10406,13 @@ static int metal_graph_decode_test(
     float *cpu_post = xmalloc((size_t)DS4_N_HC * sizeof(float));
     float *cpu_comb = xmalloc((size_t)DS4_N_HC * DS4_N_HC * sizeof(float));
     float *cpu_attn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_qr = xmalloc((size_t)q_rank * sizeof(float));
     float *cpu_qr_norm = xmalloc((size_t)q_rank * sizeof(float));
+    float *cpu_q_raw = xmalloc((size_t)q_dim * sizeof(float));
+    float *cpu_q_norm = xmalloc((size_t)q_dim * sizeof(float));
     float *cpu_q = xmalloc((size_t)q_dim * sizeof(float));
+    float *cpu_kv_raw = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
+    float *cpu_kv_norm = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
     float *cpu_kv = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
     float *cpu_heads = xmalloc((size_t)q_dim * sizeof(float));
     float *cpu_attn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
@@ -10383,9 +10427,17 @@ static int metal_graph_decode_test(
     float *cpu_after_ffn_hc = xmalloc((size_t)hc_dim * sizeof(float));
     float *cpu_logits = xmalloc((size_t)vocab_dim * sizeof(float));
     float *gpu_hc = xmalloc((size_t)hc_dim * sizeof(float));
+    float *gpu_post = xmalloc((size_t)DS4_N_HC * sizeof(float));
+    float *gpu_comb = xmalloc((size_t)DS4_N_HC * DS4_N_HC * sizeof(float));
     float *gpu_attn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     float *gpu_attn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *gpu_qr = xmalloc((size_t)q_rank * sizeof(float));
+    float *gpu_qr_norm = xmalloc((size_t)q_rank * sizeof(float));
+    float *gpu_q_raw = xmalloc((size_t)q_dim * sizeof(float));
+    float *gpu_q_norm = xmalloc((size_t)q_dim * sizeof(float));
     float *gpu_q = xmalloc((size_t)q_dim * sizeof(float));
+    float *gpu_kv_raw_pre = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
+    float *gpu_kv_norm = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
     float *gpu_kv = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
     float *gpu_raw = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
     float *gpu_attn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
@@ -10413,8 +10465,15 @@ static int metal_graph_decode_test(
                           layer->hc_attn_base,
                           cpu_hc, cpu_attn_cur, cpu_post, cpu_comb);
     layer_attn_norm_one(cpu_attn_norm, model, layer, cpu_attn_cur);
-    layer_q_projection_with_lora_one(model, layer, cpu_attn_norm, cpu_q, cpu_qr_norm);
-    layer_kv_projection_normed_one(model, layer, cpu_attn_norm, cpu_kv);
+    matvec_q8_0(cpu_qr, model, layer->attn_q_a, cpu_attn_norm);
+    rms_norm_weight(cpu_qr_norm, cpu_qr, tensor_data(model, layer->attn_q_a_norm), (uint32_t)q_rank, DS4_RMS_EPS);
+    matvec_q8_0(cpu_q_raw, model, layer->attn_q_b, cpu_qr_norm);
+    memcpy(cpu_q_norm, cpu_q_raw, (size_t)q_dim * sizeof(cpu_q_norm[0]));
+    head_rms_norm_inplace(cpu_q_norm, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+    memcpy(cpu_q, cpu_q_norm, (size_t)q_dim * sizeof(cpu_q[0]));
+    matvec_q8_0(cpu_kv_raw, model, layer->attn_kv, cpu_attn_norm);
+    rms_norm_weight(cpu_kv_norm, cpu_kv_raw, tensor_data(model, layer->attn_kv_a_norm), DS4_N_HEAD_DIM, DS4_RMS_EPS);
+    memcpy(cpu_kv, cpu_kv_norm, (size_t)DS4_N_HEAD_DIM * sizeof(cpu_kv[0]));
     rope_tail_layer_inplace(cpu_q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, 0, false);
     rope_tail_layer_inplace(cpu_kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, 0, 0, false);
     dsv4_fp8_kv_quantize_row_inplace_cpu(cpu_kv, DS4_N_HEAD_DIM, DS4_N_ROT);
@@ -10458,6 +10517,23 @@ static int metal_graph_decode_test(
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc(&g, weights, layer);
+    ds4_gpu_tensor *snap_attn_post = ok ? ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float)) : NULL;
+    ds4_gpu_tensor *snap_attn_comb = ok ? ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * DS4_N_HC * sizeof(float)) : NULL;
+    ds4_gpu_tensor *snap_qr = ok ? ds4_gpu_tensor_alloc(q_rank * sizeof(float)) : NULL;
+    ds4_gpu_tensor *snap_qr_norm = ok ? ds4_gpu_tensor_alloc(q_rank * sizeof(float)) : NULL;
+    ds4_gpu_tensor *snap_q_raw = ok ? ds4_gpu_tensor_alloc(q_dim * sizeof(float)) : NULL;
+    ds4_gpu_tensor *snap_q_norm = ok ? ds4_gpu_tensor_alloc(q_dim * sizeof(float)) : NULL;
+    ds4_gpu_tensor *snap_kv_raw = ok ? ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float)) : NULL;
+    ds4_gpu_tensor *snap_kv_norm = ok ? ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float)) : NULL;
+    if (ok) ok = snap_attn_post && snap_attn_comb && snap_qr && snap_qr_norm && snap_q_raw && snap_q_norm && snap_kv_raw && snap_kv_norm;
+    g.debug_attn_post = snap_attn_post;
+    g.debug_attn_comb = snap_attn_comb;
+    g.debug_qr = snap_qr;
+    g.debug_qr_norm = snap_qr_norm;
+    g.debug_q_raw = snap_q_raw;
+    g.debug_q_norm = snap_q_norm;
+    g.debug_kv_raw = snap_kv_raw;
+    g.debug_kv_norm = snap_kv_norm;
     g.materialize_ffn_out = true;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
@@ -10488,8 +10564,16 @@ static int metal_graph_decode_test(
 
     if (ok) {
         ok = ds4_gpu_tensor_read(g.after_ffn_hc, 0, gpu_hc, hc_dim * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_read(snap_attn_post, 0, gpu_post, (uint64_t)DS4_N_HC * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_read(snap_attn_comb, 0, gpu_comb, (uint64_t)DS4_N_HC * DS4_N_HC * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.attn_cur, 0, gpu_attn_cur, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.attn_norm, 0, gpu_attn_norm, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_read(snap_qr, 0, gpu_qr, q_rank * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_read(snap_qr_norm, 0, gpu_qr_norm, q_rank * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_read(snap_q_raw, 0, gpu_q_raw, q_dim * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_read(snap_q_norm, 0, gpu_q_norm, q_dim * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_read(snap_kv_raw, 0, gpu_kv_raw_pre, (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_read(snap_kv_norm, 0, gpu_kv_norm, (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.q, 0, gpu_q, q_dim * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.kv, 0, gpu_kv, (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(g.layer_raw_cache[0], 0, gpu_raw, (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) != 0 &&
@@ -10508,11 +10592,19 @@ static int metal_graph_decode_test(
 
     if (ok) {
         fprintf(stderr,
-                "ds4: Metal graph test layer0 diffs: embed_hc=%g hc_pre=%g attn_norm=%g q_rope=%g kv_rope=%g raw_cache=%g attn_out=%g after_attn_hc=%g ffn_cur=%g ffn_norm=%g shared=%g router_w=%g routed=%g ffn_out=%g after_ffn_hc=%g logits=%g\n",
+                "ds4: Metal graph test layer0 diffs: embed_hc=%g hc_pre=%g hc_post_w=%g hc_comb=%g attn_norm=%g q_lora=%g q_lora_norm=%g Qraw=%g Qnorm=%g q_rope=%g KVraw=%g KVnorm=%g kv_rope=%g raw_cache=%g attn_out=%g after_attn_hc=%g ffn_cur=%g ffn_norm=%g shared=%g router_w=%g routed=%g ffn_out=%g after_ffn_hc=%g logits=%g\n",
                 max_abs_diff(cpu_hc, gpu_hc, hc_dim),
                 max_abs_diff(cpu_attn_cur, gpu_attn_cur, DS4_N_EMBD),
+                max_abs_diff(cpu_post, gpu_post, DS4_N_HC),
+                max_abs_diff(cpu_comb, gpu_comb, (uint64_t)DS4_N_HC * DS4_N_HC),
                 max_abs_diff(cpu_attn_norm, gpu_attn_norm, DS4_N_EMBD),
+                max_abs_diff(cpu_qr, gpu_qr, q_rank),
+                max_abs_diff(cpu_qr_norm, gpu_qr_norm, q_rank),
+                max_abs_diff(cpu_q_raw, gpu_q_raw, q_dim),
+                max_abs_diff(cpu_q_norm, gpu_q_norm, q_dim),
                 max_abs_diff(cpu_q, gpu_q, q_dim),
+                max_abs_diff(cpu_kv_raw, gpu_kv_raw_pre, DS4_N_HEAD_DIM),
+                max_abs_diff(cpu_kv_norm, gpu_kv_norm, DS4_N_HEAD_DIM),
                 max_abs_diff(cpu_kv, gpu_kv, DS4_N_HEAD_DIM),
                 max_abs_diff(cpu_kv, gpu_raw, DS4_N_HEAD_DIM),
                 max_abs_diff(cpu_attn_out, gpu_attn_out, DS4_N_EMBD),
@@ -10541,7 +10633,23 @@ static int metal_graph_decode_test(
         }
     }
 
+    g.debug_attn_post = NULL;
+    g.debug_attn_comb = NULL;
+    g.debug_qr = NULL;
+    g.debug_qr_norm = NULL;
+    g.debug_q_raw = NULL;
+    g.debug_q_norm = NULL;
+    g.debug_kv_raw = NULL;
+    g.debug_kv_norm = NULL;
     metal_graph_free(&g);
+    ds4_gpu_tensor_free(snap_kv_norm);
+    ds4_gpu_tensor_free(snap_kv_raw);
+    ds4_gpu_tensor_free(snap_q_norm);
+    ds4_gpu_tensor_free(snap_q_raw);
+    ds4_gpu_tensor_free(snap_qr_norm);
+    ds4_gpu_tensor_free(snap_qr);
+    ds4_gpu_tensor_free(snap_attn_comb);
+    ds4_gpu_tensor_free(snap_attn_post);
     free(routed_midq);
     free(routed_xq);
     free(routed_mid_all);
@@ -10556,12 +10664,24 @@ static int metal_graph_decode_test(
     free(gpu_attn_out);
     free(gpu_raw);
     free(gpu_kv);
+    free(gpu_kv_norm);
+    free(gpu_kv_raw_pre);
     free(gpu_q);
+    free(gpu_q_norm);
+    free(gpu_q_raw);
+    free(gpu_qr_norm);
+    free(gpu_qr);
     free(gpu_attn_norm);
     free(gpu_attn_cur);
+    free(gpu_comb);
+    free(gpu_post);
     free(gpu_hc);
     free(cpu_kv);
+    free(cpu_kv_norm);
+    free(cpu_kv_raw);
     free(cpu_q);
+    free(cpu_q_norm);
+    free(cpu_q_raw);
     free(cpu_attn_out);
     free(cpu_heads);
     free(cpu_ffn_norm);
@@ -10575,6 +10695,7 @@ static int metal_graph_decode_test(
     free(cpu_ffn_cur);
     free(cpu_after_attn_hc);
     free(cpu_qr_norm);
+    free(cpu_qr);
     free(cpu_attn_norm);
     free(cpu_comb);
     free(cpu_post);
