@@ -150,6 +150,7 @@ extern void ds4_ascend_launch_attention_prefill_raw(void *stream, void *heads, c
 extern void ds4_ascend_launch_attention_decode(void *stream, void *heads, const void *sinks, const void *q, const void *raw_kv, const void *comp_kv, const void *comp_mask, uint32_t use_comp_mask, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t n_head, uint32_t head_dim, float scale);
 extern void ds4_ascend_launch_attention_prefill_mixed(void *stream, void *heads, const void *sinks, const void *q, const void *raw_kv, const void *comp_kv, const void *comp_mask, uint32_t use_comp_mask, uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim, float scale);
 extern void ds4_ascend_launch_attention_output_low_q8(void *stream, void *low, const void *w, const void *heads, uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens);
+extern void ds4_ascend_launch_attention_output_low_q8_prequant(void *stream, void *low, const void *w, const void *xq, const void *xscale, uint32_t group_dim, uint32_t rank, uint32_t n_groups, uint32_t n_tokens);
 extern void ds4_ascend_launch_router_select(void *stream, void *selected, void *weights, void *probs, const void *bias, const void *hash, const void *logits, const void *tokens, int32_t token_scalar, uint32_t hash_rows, uint32_t n_tokens, uint32_t has_bias, uint32_t hash_mode);
 extern void ds4_ascend_launch_moe_gate_up_mid_iq2_q8(void *stream, void *gate_out, void *up_out, void *mid_out, const void *gate_w, const void *up_w, const void *xq, const void *selected, const void *weights, const void *ksigns, const void *grid, uint32_t pair_count, uint32_t n_expert, uint32_t expert_begin, uint32_t expert_count, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, float clamp);
 extern void ds4_ascend_launch_moe_down_q2_q8(void *stream, void *experts_out, const void *down_w, const void *midq, const void *selected, uint32_t pair_count, uint32_t expert_begin, uint32_t expert_count, uint32_t expert_mid_dim, uint32_t out_dim, uint64_t down_expert_bytes, uint64_t down_row_bytes);
@@ -1122,7 +1123,43 @@ static int ascend_swiglu_host(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, c
     return ok;
 }
 
+static int ascend_shared_gate_up_swiglu_q8_0_tensor(ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!gate || !up || !mid || !model_map || !x || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
+    const uint64_t blocks = (in_dim + DS4_ASCEND_QK8_0 - 1) / DS4_ASCEND_QK8_0;
+    const uint64_t row_bytes = blocks * DS4_ASCEND_BLOCK_Q8_0_BYTES;
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    const uint64_t x_count = n_tok * in_dim;
+    const uint64_t out_count = n_tok * out_dim;
+    if (gate_offset > model_size || up_offset > model_size ||
+        weight_bytes > model_size - gate_offset || weight_bytes > model_size - up_offset ||
+        x->bytes < x_count * sizeof(float) || gate->bytes < out_count * sizeof(float) ||
+        up->bytes < out_count * sizeof(float) || mid->bytes < out_count * sizeof(float) ||
+        x->device != gate->device || x->device != up->device || x->device != mid->device) return 0;
+    void *gate_dev = ascend_model_range_device_ptr(model_map, model_size, gate_offset, weight_bytes, x->device, "shared_gate_q8_0");
+    void *up_dev = ascend_model_range_device_ptr(model_map, model_size, up_offset, weight_bytes, x->device, "shared_up_q8_0");
+    if (!gate_dev || !up_dev) return 0;
+    if (!ascend_set_context(x->device) || !g_streams[x->device]) return 0;
+    const uint64_t xq_bytes = n_tok * blocks * DS4_ASCEND_QK8_0;
+    const uint64_t xscale_bytes = n_tok * blocks * sizeof(float);
+    ds4_gpu_tensor *xq = ascend_tensor_alloc_on_device(xq_bytes, x->device);
+    ds4_gpu_tensor *xscale = ascend_tensor_alloc_on_device(xscale_bytes, x->device);
+    if (!xq || !xscale) {
+        ds4_gpu_tensor_free(xq);
+        ds4_gpu_tensor_free(xscale);
+        return 0;
+    }
+    ds4_ascend_launch_quantize_q8_0(g_streams[x->device], xq->ptr, xscale->ptr, x->ptr, (uint32_t)in_dim, (uint32_t)n_tok);
+    ds4_ascend_launch_matmul_q8_0_prequant(g_streams[x->device], gate->ptr, gate_dev, xq->ptr, xscale->ptr, (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+    ds4_ascend_launch_matmul_q8_0_prequant(g_streams[x->device], up->ptr, up_dev, xq->ptr, xscale->ptr, (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+    int ok = ascend_swiglu_device(mid, gate, up, out_count, 10.0f, 1.0f);
+    int defer_ok = ascend_defer_free_tensor(xq);
+    defer_ok = ascend_defer_free_tensor(xscale) && defer_ok;
+    return ok && defer_ok;
+}
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x) {
+    if (ascend_shared_gate_up_swiglu_q8_0_tensor(gate, up, mid, model_map, model_size, gate_offset, up_offset, in_dim, out_dim, x, 1)) return 1;
     return ascend_matmul_q8_0_tensor(gate, model_map, model_size, gate_offset, in_dim, out_dim, x, 1) &&
            ascend_matmul_q8_0_tensor(up, model_map, model_size, up_offset, in_dim, out_dim, x, 1) &&
            (ascend_swiglu_device(mid, gate, up, out_dim, 10.0f, 1.0f) || ascend_swiglu_host(mid, gate, up, out_dim, 10.0f, 1.0f));
@@ -1731,8 +1768,25 @@ static int ascend_attention_output_low_q8(ds4_gpu_tensor *low, const void *model
     void *w_dev = ascend_model_range_device_ptr(model_map, model_size, out_a_offset, weight_bytes, heads->device, "attn_out_a");
     if (!w_dev) return 0;
     if (!ascend_set_context(heads->device) || !g_streams[heads->device]) return 0;
-    ds4_ascend_launch_attention_output_low_q8(g_streams[heads->device], low->ptr, w_dev, heads->ptr, (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens);
-    return 1;
+    /* Quantize heads once (n_tokens*n_groups rows of group_dim), reuse for all rank outputs */
+    const uint64_t xq_rows = (uint64_t)n_tokens * n_groups;
+    if (xq_rows > UINT32_MAX) return 0;
+    const uint64_t xq_bytes = xq_rows * blocks * DS4_ASCEND_QK8_0;
+    const uint64_t xscale_bytes = xq_rows * blocks * sizeof(float);
+    ds4_gpu_tensor *xq = ascend_tensor_alloc_on_device(xq_bytes, heads->device);
+    ds4_gpu_tensor *xscale = ascend_tensor_alloc_on_device(xscale_bytes, heads->device);
+    if (!xq || !xscale) {
+        ds4_gpu_tensor_free(xq);
+        ds4_gpu_tensor_free(xscale);
+        /* fall back to inline-quantize kernel */
+        ds4_ascend_launch_attention_output_low_q8(g_streams[heads->device], low->ptr, w_dev, heads->ptr, (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens);
+        return 1;
+    }
+    ds4_ascend_launch_quantize_q8_0(g_streams[heads->device], xq->ptr, xscale->ptr, heads->ptr, (uint32_t)group_dim, (uint32_t)xq_rows);
+    ds4_ascend_launch_attention_output_low_q8_prequant(g_streams[heads->device], low->ptr, w_dev, xq->ptr, xscale->ptr, (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens);
+    int ok = ascend_defer_free_tensor(xq);
+    ok = ascend_defer_free_tensor(xscale) && ok;
+    return ok;
 }
 
 int ds4_gpu_attention_output_q8_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *low, ds4_gpu_tensor *group_tmp, ds4_gpu_tensor *low_tmp, const void *model_map, uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset, uint64_t group_dim, uint64_t rank, uint32_t n_groups, uint64_t out_dim, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
