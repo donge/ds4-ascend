@@ -1924,39 +1924,52 @@ static int ascend_routed_moe_device_iq2_q2(ds4_gpu_tensor *out, ds4_gpu_tensor *
     const uint64_t mid_float_bytes = pair_count64 * expert_mid_dim * sizeof(float);
     const uint64_t expert_float_bytes = pair_count64 * out_dim * sizeof(float);
 
-    ds4_gpu_tensor *xq_canon = ascend_tensor_alloc_on_device(xq_bytes, canonical);
     ds4_gpu_tensor *midq_canon = ascend_tensor_alloc_on_device(midq_bytes, canonical);
     /* merge_tmp must hold 3*mid_float_bytes for combined gum copy, or expert_float_bytes for the down copy */
     const uint64_t gum_bytes = 3 * mid_float_bytes;
     const uint64_t merge_tmp_bytes = expert_float_bytes > gum_bytes ? expert_float_bytes : gum_bytes;
     ds4_gpu_tensor *merge_tmp = ascend_tensor_alloc_on_device(merge_tmp_bytes, canonical);
-    ds4_gpu_tensor *selected_remote = ascend_tensor_alloc_on_device(selected_bytes, remote);
-    ds4_gpu_tensor *weights_remote = ascend_tensor_alloc_on_device(weights_bytes, remote);
-    ds4_gpu_tensor *xq_remote = ascend_tensor_alloc_on_device(xq_bytes, remote);
+    /* fwd bundle: xq + selected + weights packed together in remote for fewer allocs */
+    const uint64_t fwd_xq_offset       = 0;
+    const uint64_t fwd_selected_offset = xq_bytes;
+    const uint64_t fwd_weights_offset  = fwd_selected_offset + selected_bytes;
+    const uint64_t fwd_bytes           = fwd_weights_offset + weights_bytes;
+    ds4_gpu_tensor *fwd_canon  = ascend_tensor_alloc_on_device(xq_bytes, canonical);
+    ds4_gpu_tensor *fwd_remote = ascend_tensor_alloc_on_device(fwd_bytes, remote);
     /* single combined buffer for gate/up/mid on remote — 3 separate allocs replaced */
     ds4_gpu_tensor *gum_remote = ascend_tensor_alloc_on_device(gum_bytes, remote);
     ds4_gpu_tensor *midq_remote = ascend_tensor_alloc_on_device(midq_bytes, remote);
     ds4_gpu_tensor *experts_remote = ascend_tensor_alloc_on_device(expert_float_bytes, remote);
-    int ok = xq_canon && midq_canon && merge_tmp && selected_remote && weights_remote && xq_remote && gum_remote && midq_remote && experts_remote;
+    int ok = midq_canon && merge_tmp && fwd_canon && fwd_remote && gum_remote && midq_remote && experts_remote;
 
+    /* Slice pointers into fwd bundles */
+    void *xq_canon_ptr        = fwd_canon  ? (uint8_t *)fwd_canon->ptr  + fwd_xq_offset       : NULL;
+    void *xq_remote_ptr       = fwd_remote ? (uint8_t *)fwd_remote->ptr + fwd_xq_offset        : NULL;
+    void *selected_remote_ptr = fwd_remote ? (uint8_t *)fwd_remote->ptr + fwd_selected_offset  : NULL;
+    void *weights_remote_ptr  = fwd_remote ? (uint8_t *)fwd_remote->ptr + fwd_weights_offset   : NULL;
     /* Derive gate/up/mid pointers into the combined gum buffer */
     void *gate_remote_ptr = gum_remote ? gum_remote->ptr : NULL;
     void *up_remote_ptr   = gum_remote ? (uint8_t *)gum_remote->ptr + mid_float_bytes : NULL;
     void *mid_remote_ptr  = gum_remote ? (uint8_t *)gum_remote->ptr + 2 * mid_float_bytes : NULL;
 
-    if (ok) ok = ds4_gpu_ascend_quantize_q8_k_tensor(xq_canon, x, n_tokens, expert_in_dim);
-    if (ok) ok = ascend_device_to_device_copy(xq_remote->ptr, remote, xq_canon->ptr, canonical, xq_bytes, "copy moe xq");
-    if (ok) ok = ascend_device_to_device_copy(selected_remote->ptr, remote, selected->ptr, canonical, selected_bytes, "copy moe selected");
-    if (ok) ok = ascend_device_to_device_copy(weights_remote->ptr, remote, weights->ptr, canonical, weights_bytes, "copy moe weights");
+    /* quantize xq into fwd_canon slice, then copy selected/weights directly into fwd_remote offsets */
+    if (ok) {
+        ds4_gpu_tensor xq_view = { .ptr = xq_canon_ptr, .bytes = xq_bytes, .device = canonical };
+        ok = ds4_gpu_ascend_quantize_q8_k_tensor(&xq_view, x, n_tokens, expert_in_dim);
+    }
+    /* copy xq canonical→remote once; copy selected/weights into their fwd_remote slots directly */
+    if (ok) ok = ascend_device_to_device_copy(xq_remote_ptr, remote, xq_canon_ptr, canonical, xq_bytes, "copy moe xq bundle");
+    if (ok) ok = ascend_device_to_device_copy(selected_remote_ptr, remote, selected->ptr, canonical, selected_bytes, "copy moe selected bundle");
+    if (ok) ok = ascend_device_to_device_copy(weights_remote_ptr,  remote, weights->ptr,  canonical, weights_bytes,  "copy moe weights bundle");
 
     if (ok) ok = ascend_require_iq2_tables(canonical) && ascend_require_iq2_tables(remote);
     if (ok) {
         if (!ascend_set_context(canonical) || !g_streams[canonical]) ok = 0;
-        else ds4_ascend_launch_moe_gate_up_mid_iq2_q8(g_streams[canonical], gate->ptr, up->ptr, mid->ptr, gate_cache->device[canonical]->ptr, up_cache->device[canonical]->ptr, xq_canon->ptr, selected->ptr, weights->ptr, g_iq2_ksigns_dev[canonical]->ptr, g_iq2_grid_dev[canonical]->ptr, pair_count, n_expert, gate_cache->expert_begin[canonical], gate_cache->expert_count[canonical], expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
+        else ds4_ascend_launch_moe_gate_up_mid_iq2_q8(g_streams[canonical], gate->ptr, up->ptr, mid->ptr, gate_cache->device[canonical]->ptr, up_cache->device[canonical]->ptr, xq_canon_ptr, selected->ptr, weights->ptr, g_iq2_ksigns_dev[canonical]->ptr, g_iq2_grid_dev[canonical]->ptr, pair_count, n_expert, gate_cache->expert_begin[canonical], gate_cache->expert_count[canonical], expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
     }
     if (ok) {
         if (!ascend_set_context(remote) || !g_streams[remote]) ok = 0;
-        else ds4_ascend_launch_moe_gate_up_mid_iq2_q8(g_streams[remote], gate_remote_ptr, up_remote_ptr, mid_remote_ptr, gate_cache->device[remote]->ptr, up_cache->device[remote]->ptr, xq_remote->ptr, selected_remote->ptr, weights_remote->ptr, g_iq2_ksigns_dev[remote]->ptr, g_iq2_grid_dev[remote]->ptr, pair_count, n_expert, gate_cache->expert_begin[remote], gate_cache->expert_count[remote], expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
+        else ds4_ascend_launch_moe_gate_up_mid_iq2_q8(g_streams[remote], gate_remote_ptr, up_remote_ptr, mid_remote_ptr, gate_cache->device[remote]->ptr, up_cache->device[remote]->ptr, xq_remote_ptr, selected_remote_ptr, weights_remote_ptr, g_iq2_ksigns_dev[remote]->ptr, g_iq2_grid_dev[remote]->ptr, pair_count, n_expert, gate_cache->expert_begin[remote], gate_cache->expert_count[remote], expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
     }
 
     /* Single combined copy of gate+up+mid from remote (3 copies → 1, saving 4 stream syncs) */
@@ -1983,7 +1996,7 @@ static int ascend_routed_moe_device_iq2_q2(ds4_gpu_tensor *out, ds4_gpu_tensor *
     }
     if (ok) {
         if (!ascend_set_context(remote) || !g_streams[remote]) ok = 0;
-        else ds4_ascend_launch_moe_down_q2_q8(g_streams[remote], experts_remote->ptr, down_cache->device[remote]->ptr, midq_remote->ptr, selected_remote->ptr, pair_count, down_cache->expert_begin[remote], down_cache->expert_count[remote], expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+        else ds4_ascend_launch_moe_down_q2_q8(g_streams[remote], experts_remote->ptr, down_cache->device[remote]->ptr, midq_remote->ptr, selected_remote_ptr, pair_count, down_cache->expert_begin[remote], down_cache->expert_count[remote], expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
     }
     if (ok) ok = ascend_device_to_device_copy(merge_tmp->ptr, canonical, experts_remote->ptr, remote, expert_float_bytes, "copy moe experts remote");
     if (ok) {
@@ -1999,12 +2012,10 @@ static int ascend_routed_moe_device_iq2_q2(ds4_gpu_tensor *out, ds4_gpu_tensor *
     ds4_gpu_tensor_free(experts_remote);
     ds4_gpu_tensor_free(midq_remote);
     ds4_gpu_tensor_free(gum_remote);
-    ds4_gpu_tensor_free(xq_remote);
-    ds4_gpu_tensor_free(weights_remote);
-    ds4_gpu_tensor_free(selected_remote);
+    ds4_gpu_tensor_free(fwd_remote);
+    ds4_gpu_tensor_free(fwd_canon);
     ds4_gpu_tensor_free(merge_tmp);
     ds4_gpu_tensor_free(midq_canon);
-    ds4_gpu_tensor_free(xq_canon);
     return ok;
 }
 
