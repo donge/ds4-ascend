@@ -168,8 +168,55 @@ prefill, not steady-state decode:
   values on very short runs are not useful steady-state throughput numbers.
 
 Decode throughput must be interpreted from longer generation runs after startup
-and prefill complete. The current Ascend backend should be treated as runnable
-and correctness-gated, with only an initial Q8_0 projection optimization applied.
+and prefill complete.
+
+### Optimization history
+
+The following optimizations have been validated and committed in order:
+
+1. **Q8_0 shared activation prequantization** (`2fc0819`): shared gate/up
+   projection activations are quantized once and reused across all output rows
+   instead of re-quantizing per row.
+
+2. **Attention output Q8_0 prequantization** (`7f1d55b`): attention output
+   projection activation is quantized once and reused across all rank output rows,
+   eliminating redundant per-row quantization.
+
+3. **Routed MoE gate/up/mid return copy merge** (`c702f4f`): gate, up, and mid
+   remote-to-canonical copies are merged into a single combined cross-device
+   transfer, reducing stream synchronization overhead by roughly 4 syncs × 43
+   layers per decode step.
+
+4. **Routed MoE forward bundle copy merge** (`4155212`): xq activation, selected
+   expert indices, and routing weights are packed into a single canonical buffer
+   and transferred in one cross-device copy, reducing forward D2D syncs by 2 × 43
+   layers per decode step.
+
+### Hotspot analysis conclusion
+
+Wall-clock timing instrumented at each MoE phase (43 layers of prefill) shows:
+
+| Phase | Time | Share |
+|-------|------|-------|
+| `gum_copy` (wait for remote gate_up_mid kernel) | 439.5 s | 56 % |
+| `down_copy` (wait for remote down kernel) | 166.3 s | 21 % |
+| `fwd_copy` (forward D2D transfer) | 163.7 s | 21 % |
+| All other phases | 16.8 s | 2 % |
+
+98 % of decode time is AICore kernel execution on the Ascend 310P3. The kernels
+(`ds4_moe_gate_up_mid_iq2_q8`, `ds4_moe_down_q2_q8`) are tagged
+`__attribute__((aiv))` but are implemented as scalar loops reading directly from
+global memory. The 310P3 has 256-bit vector hardware that is not yet used.
+
+The dominant cost is global-memory (GM) access latency rather than arithmetic:
+each dot product accesses roughly 5 KB from GM with random-access lookup patterns.
+Estimated AICore utilization is well under 0.01 % of the 128 TOPS peak.
+
+Further optimization of this bottleneck requires either AscendC SIMD vectorization
+of the IQ2_XXS and Q2_K dot products (complex due to lookup-table structure) or a
+fundamentally different quantization format that maps better to the hardware.
+Cross-device copy overhead has now been reduced to a secondary cost and does not
+represent the primary optimization target.
 
 ## Known non-goals for this stage
 
@@ -192,17 +239,16 @@ Correctness plan:
 4. Stop on the first semantic, fallback, NaN, or runtime failure and return to
    graph diagnostics.
 
-Optimization plan after the longer correctness smoke passes:
+Optimization notes:
 
-1. Reduce startup cost by avoiding repeated full expert sharding work where
-   possible.
-2. Replace correctness-first prefill attention with a more vectorized or online
-   implementation.
-3. Optimize FFN/MoE orchestration, especially scratch allocation, cross-device
-   copies, and launch count.
-4. Reuse short-lived RoPE and temporary buffers instead of allocating them per
-   operation.
-5. Continue profiling compressor prefill, output head, and router/MoE kernels
-   after the Q8_0 prequantization improvement.
-6. Consider making the Ascend link dependency set permanent in `Makefile` if the
-   project keeps targeting CANN 9.0.
+1. Cross-device copy overhead has been reduced by four optimization passes (see
+   history above). Further D2D savings are marginal — the remaining copies are
+   load-bearing and cannot be avoided without a topology change.
+2. AICore kernel compute is now the dominant bottleneck (98 % of decode time).
+   Vectorizing `ds4_dot_iq2_xxs_q8_K` and `ds4_dot_q2_K_q8_K` with AscendC
+   `LocalTensor` SIMD APIs is the primary remaining optimization lever, but
+   requires nontrivial kernel rewriting due to IQ2_XXS lookup-table structure.
+3. Startup cost (expert sharding ~140s) could be reduced by persisting sharded
+   tensors to disk or by reducing the sharding granularity.
+4. Replace correctness-first prefill attention with a more vectorized or online
+   implementation once decode throughput is the governing constraint.
